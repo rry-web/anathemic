@@ -163,6 +163,16 @@ impl std::fmt::Debug for Hash32 {
     }
 }
 
+/// A BitTorrent v1 info hash
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Hash20(#[serde(with = "serde_bytes")] pub [u8; 20]);
+
+impl std::fmt::Debug for Hash20 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
 /// A sealed epoch, as the manifest lists it
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SealedRef {
@@ -170,6 +180,10 @@ pub struct SealedRef {
     /// Of the compressed bundle, which is what mirrors hold
     pub sha256: Hash32,
     pub size: u64,
+    /// The bundle's torrent (see [`crate::torrent`]), which mirrors share over I2P. Missing
+    /// only from manifests made before mirroring
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infohash: Option<Hash20>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

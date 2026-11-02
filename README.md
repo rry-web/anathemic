@@ -5,8 +5,8 @@ members mirror it. Text goes over I2P only. Media goes over I2P or clearnet BitT
 board allows. Old pages are frozen, hashed and signed, so they survive the server going down.
 No JavaScript, anywhere.
 
-The plan is in [DESIGN.md](DESIGN.md). This is an early prototype of its first phase, the text
-core:
+The plan is in [DESIGN.md](DESIGN.md). This is an early prototype of its first two phases,
+the text core and mirroring:
 
 - **The server** accepts signed posts and closes each board's epochs after a number of posts or
   a length of time. Once an epoch's moderation window is over, the server seals it into a hashed,
@@ -19,9 +19,14 @@ core:
   so unlike the client they don't check signatures. Boards can also take anonymous posts from
   these pages, if the operator turns it on. No member signs those posts, so they're rate limited
   instead.
+- **Mirroring:** each sealed epoch is also a standard BitTorrent v1 torrent, its info hash listed
+  in the signed manifest. The server is the site's tracker, inside I2P. **The node**
+  (`anathemic-node`) keeps a copy of a site's sealed epochs and shares them with other nodes over
+  I2P, through the router's SAM bridge. It takes the server's copy only when no other node has
+  one.
 
-Not yet: mirroring between members, moderation, media, tags, a full
-client UI.
+Not yet: reading from mirrors while the server is down (manifests relayed between nodes), the
+seeding quota, moderation, media, tags, a full client UI.
 
 ## Trying it
 
@@ -81,6 +86,28 @@ anathemic-server --data mysite set-site --address mysite.i2p --address <the tunn
 
 The web pages make the site an ordinary eepsite: rynx reads the same address through the router,
 in I2P mode, and can post on boards with web posting on.
+
+The same tunnel carries the site's tracker (`/announce`). The tunnel adds an `X-I2P-DestB64`
+header to each request, and the tracker takes each peer's destination from it, so keep `serve`
+listening on 127.0.0.1, where only the tunnel can reach it.
+
+### Mirroring
+
+A node needs a router with SAM on (`[sam] enabled = true` in `i2pd.conf`; port 7656):
+
+```sh
+anathemic-node http://<the site's address>.b32.i2p
+```
+
+It shares `~/.anathemic` with the client, so the client reads the epochs the node fetched, and
+the node seeds the ones the client fetched. Each site gets its own I2P destination, saved in
+`~/.anathemic/node/`, so trackers can't link the sites one node mirrors. A node looks for other
+nodes for 5 minutes before taking the server's copy (`--peer-seconds`), and checks the manifest
+for newly sealed epochs every 10 minutes (`--check-seconds`). `--board` limits it to some
+boards, and `-v` shows each connection and announce.
+
+Other BitTorrent clients with I2P support can seed too: each epoch's torrent is at
+`/boards/<board>/epochs/<n>/torrent`, announcing to the site's tracker.
 
 ## License
 

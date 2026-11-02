@@ -11,8 +11,9 @@ use std::{
 };
 
 use anathemic_core::{
-    Authors, BoardEntry, Content, Context, Epoch, FORMAT, Hash32, Manifest, Post, PublicKey, SealedRef,
-    SecretKey, Signed, SiteCert, Submission, Time, cbor, check_site_text, epoch, now, valid_address, valid_board_name,
+    Authors, BoardEntry, Content, Context, Epoch, FORMAT, Hash20, Hash32, Manifest, Post, PublicKey, SealedRef,
+    SecretKey, Signed, SiteCert, Submission, Time, cbor, check_site_text, epoch, now, torrent, valid_address,
+    valid_board_name,
 };
 use anyhow::{Context as _, bail};
 use axum::{
@@ -26,6 +27,7 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+pub mod tracker;
 pub mod web;
 
 const ROOT_KEY: &str = "root.key";
@@ -95,12 +97,31 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
     if has_web == 0 {
         db.execute_batch("alter table boards add column web integer not null default 0;")?;
     }
+    let has_infohash: i64 =
+        db.query_row("select count(*) from pragma_table_info('epochs') where name = 'infohash'", [], |r| r.get(0))?;
+    if has_infohash == 0 {
+        db.execute_batch("alter table epochs add column infohash blob;")?;
+    }
     db.execute_batch(
         "insert or ignore into meta values('name', '');
          insert or ignore into meta values('description', '');
          insert or ignore into meta values('addresses', '');
-         create index if not exists posts_by_thread on posts(board, thread, number);",
-    )
+         create index if not exists posts_by_thread on posts(board, thread, number);
+         create index if not exists epochs_by_infohash on epochs(infohash);",
+    )?;
+    // Epochs sealed before mirroring get their torrents now
+    let unhashed: Vec<(String, i64, Vec<u8>)> = db
+        .prepare("select board, number, bundle from epochs where state = 'sealed' and infohash is null")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (board, number, bundle) in &unhashed {
+        let hash = torrent::bundle_hash(bundle, board, *number as u64);
+        db.execute("update epochs set infohash = ?3 where board = ?1 and number = ?2", params![board, number, hash.0.to_vec()])?;
+    }
+    if !unhashed.is_empty() {
+        bump(db)?;
+    }
+    Ok(())
 }
 
 /// What `set-site` changes; `None` leaves a field as it is
@@ -230,6 +251,8 @@ pub struct Site {
     config: Config,
     /// When recent web posts were made, by board and by board and destination
     web_posts: Mutex<HashMap<String, Vec<Time>>>,
+    /// Who holds which sealed epochs
+    pub tracker: tracker::Tracker,
 }
 
 impl Site {
@@ -244,7 +267,7 @@ impl Site {
         if cert.open(Context::SiteCert, Some(&root))?.site_key != key.public() {
             bail!("{SITE_KEY} isn't the key the root key certified");
         }
-        Ok(Site { db: Mutex::new(db), key, root, cert, config, web_posts: Mutex::new(HashMap::new()) })
+        Ok(Site { db: Mutex::new(db), key, root, cert, config, web_posts: Mutex::new(HashMap::new()), tracker: Default::default() })
     }
 
     pub fn root(&self) -> PublicKey {
@@ -268,7 +291,7 @@ impl Site {
             let mut sealed = Vec::new();
             let mut unsealed = Vec::new();
             let mut epochs = db.prepare(
-                "select number, state, sha256, length(bundle) from epochs where board = ?1 order by number",
+                "select number, state, sha256, length(bundle), infohash from epochs where board = ?1 order by number",
             )?;
             let mut rows = epochs.query([&name])?;
             while let Some(r) = rows.next()? {
@@ -276,7 +299,9 @@ impl Site {
                 if r.get::<_, String>(1)? == "sealed" {
                     let sha256: Vec<u8> = r.get(2)?;
                     let sha256 = Hash32(sha256.try_into().map_err(|_| Fail::Internal("bad epoch hash".into()))?);
-                    sealed.push(SealedRef { epoch: number as u64, sha256, size: r.get::<_, i64>(3)? as u64 });
+                    let infohash: Option<Vec<u8>> = r.get(4)?;
+                    let infohash = infohash.and_then(|hash| hash.try_into().ok()).map(Hash20);
+                    sealed.push(SealedRef { epoch: number as u64, sha256, size: r.get::<_, i64>(3)? as u64, infohash });
                 } else {
                     unsealed.push(number as u64);
                 }
@@ -311,6 +336,21 @@ impl Site {
             )
             .optional()?
             .ok_or(Fail::NotFound)
+    }
+
+    /// A sealed epoch's torrent file, announcing to the site's tracker at each of its addresses
+    pub fn torrent(&self, board: &str, number: u64) -> Result<Vec<u8>, Fail> {
+        let bundle = self.bundle(board, number)?;
+        let (_, _, addresses) = self.about()?;
+        let trackers: Vec<String> = addresses.iter().map(|address| format!("http://{address}/announce")).collect();
+        Ok(torrent::file(&torrent::info(&bundle, board, number), &trackers))
+    }
+
+    /// Whether an info hash is one of the site's sealed epochs, which are all its tracker tracks
+    pub fn has_torrent(&self, infohash: &Hash20) -> Result<bool, Fail> {
+        let count: i64 =
+            self.db().query_row("select count(*) from epochs where infohash = ?1", [infohash.0.to_vec()], |r| r.get(0))?;
+        Ok(count > 0)
     }
 
     /// An epoch's posts, as the server signed them
@@ -693,9 +733,10 @@ fn seal_epoch(db: &Connection, board: &str, number: i64) -> Result<(), Fail> {
     let posts = load_posts(db, board, number as u64)?;
     let epoch = Epoch { format: FORMAT, board: board.to_string(), number: number as u64, prev, posts };
     let (bundle, hash) = epoch::seal(&epoch);
+    let infohash = torrent::bundle_hash(&bundle, board, number as u64);
     db.execute(
-        "update epochs set state = 'sealed', sha256 = ?3, bundle = ?4 where board = ?1 and number = ?2",
-        params![board, number, hash.0.to_vec(), bundle],
+        "update epochs set state = 'sealed', sha256 = ?3, bundle = ?4, infohash = ?5 where board = ?1 and number = ?2",
+        params![board, number, hash.0.to_vec(), bundle, infohash.0.to_vec()],
     )?;
     bump(db)?;
     Ok(())
@@ -714,6 +755,12 @@ async fn get_bundle(State(site): State<Arc<Site>>, UrlPath((board, number)): Url
     Ok(([(header::CONTENT_TYPE, "application/zstd")], bundle).into_response())
 }
 
+async fn get_torrent(State(site): State<Arc<Site>>, UrlPath((board, number)): UrlPath<(String, u64)>) -> Result<Response, Fail> {
+    let torrent = site.torrent(&board, number)?;
+    let name = format!("attachment; filename=\"{}.torrent\"", torrent::file_name(&board, number));
+    Ok(([(header::CONTENT_TYPE, "application/x-bittorrent".to_string()), (header::CONTENT_DISPOSITION, name)], torrent).into_response())
+}
+
 async fn get_posts(State(site): State<Arc<Site>>, UrlPath((board, number)): UrlPath<(String, u64)>) -> Result<Response, Fail> {
     Ok(cbor_response(&site.posts(&board, number)?))
 }
@@ -728,6 +775,8 @@ pub fn router(site: Arc<Site>) -> Router {
         .route("/manifest", get(get_manifest))
         .route("/boards/{board}/epochs/{number}", get(get_bundle))
         .route("/boards/{board}/epochs/{number}/posts", get(get_posts))
+        .route("/boards/{board}/epochs/{number}/torrent", get(get_torrent))
+        .route("/announce", get(tracker::announce))
         .route("/boards/{board}/posts", post(post_submission))
         .merge(web::routes())
         .with_state(site)

@@ -4,7 +4,7 @@
 use std::{fs, sync::Arc};
 
 use anathemic_client::Client;
-use anathemic_core::{Authors, Content, SecretKey, now};
+use anathemic_core::{Authors, Content, SecretKey, bencode, i2p, now, torrent};
 use anathemic_server::{Config, Site, SiteSettings, add_board, init, router, set_site, set_web_posting};
 
 struct Running {
@@ -300,4 +300,69 @@ fn sites_made_by_the_first_prototype_still_open() {
     drop(db);
     let site = Site::open(dir.path(), Config::default()).unwrap();
     assert!(!site.manifest(now()).unwrap().peek().unwrap().boards[0].web_posting);
+}
+
+/// An announce to the site's tracker, as if through the I2P tunnel from `destination`
+fn announce(url: &str, infohash: &[u8; 20], destination: Option<&str>, seeding: bool) -> bencode::Value {
+    let escaped: String = infohash.iter().map(|b| format!("%{b:02X}")).collect();
+    let left = if seeding { 0 } else { 1000 };
+    let mut request = ureq::get(&format!("{url}/announce?info_hash={escaped}&peer_id=-XX0001-000000000000&port=6881&uploaded=0&downloaded=0&left={left}&compact=1"));
+    if let Some(destination) = destination {
+        request = request.set("X-I2P-DestB64", destination);
+    }
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(&mut request.call().unwrap().into_reader(), &mut body).unwrap();
+    bencode::decode(&body).unwrap()
+}
+
+#[test]
+fn sealed_epochs_are_torrents_the_site_tracks() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("site"));
+    set_site(&server.dir, SiteSettings { addresses: Some(vec!["forum.i2p".into()]), ..Default::default() }).unwrap();
+    let client = Client::new(&server.url, None, dir.path().join("home")).unwrap();
+    let key = SecretKey::generate();
+    client.submit(&key, "general", thread("Hello", "first post"), false).unwrap();
+    client.submit(&key, "general", reply(1, "second"), false).unwrap();
+    client.submit(&key, "general", reply(1, "third"), false).unwrap();
+    server.site.tick(now() + 61).unwrap();
+
+    let site = client.manifest().unwrap();
+    let sealed = &site.manifest.board("general").unwrap().sealed[0];
+    let infohash = sealed.infohash.expect("sealed epochs list their torrent");
+    let bundle = ureq::get(&format!("{}/boards/general/epochs/0", server.url)).call().unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut bundle.into_reader(), &mut bytes).unwrap();
+    assert_eq!(torrent::bundle_hash(&bytes, "general", 0), infohash);
+
+    // The torrent file holds the same info, and announces to the site's tracker
+    let file = ureq::get(&format!("{}/boards/general/epochs/0/torrent", server.url)).call().unwrap();
+    let mut file_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file.into_reader(), &mut file_bytes).unwrap();
+    torrent::info_of(&file_bytes, &infohash).unwrap();
+    let parsed = bencode::decode(&file_bytes).unwrap();
+    assert_eq!(parsed.get("announce").unwrap().bytes().unwrap(), b"http://forum.i2p/announce");
+
+    // Announces count only through the tunnel, and only for the site's own epochs
+    let seeder = format!("B{}", "A".repeat(519));
+    let leecher = format!("C{}", "A".repeat(519));
+    let refused = announce(&server.url, &infohash.0, None, false);
+    assert!(refused.get("failure reason").is_some());
+    let stranger = announce(&server.url, &[9; 20], Some(&seeder), true);
+    assert!(stranger.get("failure reason").is_some());
+
+    let first = announce(&server.url, &infohash.0, Some(&seeder), true);
+    assert_eq!(first.get("peers").unwrap().bytes().unwrap(), b"");
+    let second = announce(&server.url, &infohash.0, Some(&leecher), false);
+    let seeder_hash = i2p::destination_hash(&i2p::decode_destination(&seeder).unwrap());
+    assert_eq!(second.get("peers").unwrap().bytes().unwrap(), seeder_hash);
+    assert_eq!(second.get("complete").unwrap().int(), Some(1));
+
+    // Epochs sealed before mirroring get their info hashes when the site is next opened
+    let db = rusqlite::Connection::open(server.dir.join("site.db")).unwrap();
+    db.execute("update epochs set infohash = null", []).unwrap();
+    drop(db);
+    let reopened = Site::open(&server.dir, Config::default()).unwrap();
+    let manifest = reopened.manifest(now()).unwrap().peek().unwrap();
+    assert_eq!(manifest.board("general").unwrap().sealed[0].infohash, Some(infohash));
 }

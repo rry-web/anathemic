@@ -478,6 +478,15 @@ Phase 1 has a working prototype: the server, the command-line client and the for
 early, as web pages the server draws (`/`, `/<board>/`, `/<board>/<thread>`), because rynx is
 the client most testing happens in.
 
+Phase 2 has started. Sealed epochs are v1 torrents with their info hashes in the manifest
+(`anathemic_core::torrent`: one file named `<board>-<epoch>.zst`, 256 KiB pieces, so anyone
+holding the bundle makes the same torrent). The server tracks only its own epochs, taking each
+peer from the tunnel's `X-I2P-DestB64` header. `anathemic-node` runs librqbit behind a tracker
+proxy on localhost: librqbit announces to the proxy, which announces over SAM and swaps each I2P
+peer for a local port bridged to SAM; inbound streams are forwarded to librqbit, and an
+allowlist of 127.0.0.1 stops it dialing anything else, even peers learned by PEX. Still to do in
+this phase: relaying manifests, so clients can read from mirrors while the server is down.
+
 ## Open questions
 
 - **Deletion versus freezing:** what default moderation window suits small volunteer moderator

@@ -23,7 +23,7 @@ use serde::Deserialize;
 use crate::{EpochState, Fail, Site};
 
 /// Board names the server's own addresses use
-pub const RESERVED: &[&str] = &["boards", "manifest", "static"];
+pub const RESERVED: &[&str] = &["announce", "boards", "manifest", "static"];
 const THREADS_PER_PAGE: u64 = 50;
 /// The header an i2pd HTTP server tunnel adds, naming the visitor's destination
 const DESTINATION_HEADER: &str = "x-i2p-desthash";

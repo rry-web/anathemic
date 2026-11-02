@@ -3,11 +3,14 @@
 //! Everything that travels is CBOR. Anything signed travels as [`Signed`]: the exact bytes that
 //! were signed, so verifying never depends on encoding a value the same way twice.
 
+pub mod bencode;
 pub mod cbor;
 pub mod epoch;
+pub mod i2p;
 pub mod keys;
 pub mod markup;
 pub mod model;
+pub mod torrent;
 pub mod verify;
 
 pub use keys::{Context, PublicKey, SecretKey, Signed};

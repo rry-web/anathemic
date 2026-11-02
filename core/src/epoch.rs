@@ -139,7 +139,7 @@ mod tests {
         let site = SecretKey::generate();
         let first = epoch(&site, 0, None, &[1, 2]);
         let (bundle, hash) = seal(&first);
-        let entry = SealedRef { epoch: 0, sha256: hash, size: bundle.len() as u64 };
+        let entry = SealedRef { epoch: 0, sha256: hash, size: bundle.len() as u64, infohash: None };
         let opened = open_bundle(&bundle, &entry).unwrap();
         assert_eq!(check_epoch(&opened, "general", 0, None, &site.public()).unwrap().len(), 2);
 
@@ -152,7 +152,7 @@ mod tests {
     fn altered_bundles_and_strangers_posts_are_refused() {
         let site = SecretKey::generate();
         let (mut bundle, hash) = seal(&epoch(&site, 0, None, &[1]));
-        let entry = SealedRef { epoch: 0, sha256: hash, size: bundle.len() as u64 };
+        let entry = SealedRef { epoch: 0, sha256: hash, size: bundle.len() as u64, infohash: None };
         bundle[10] ^= 1;
         assert!(open_bundle(&bundle, &entry).is_err());
 

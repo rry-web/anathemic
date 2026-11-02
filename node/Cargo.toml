@@ -1,0 +1,17 @@
+[package]
+name = "anathemic-node"
+description = "Mirrors an Anathemic swarmboard's sealed epochs over I2P torrents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anathemic-core.workspace = true
+anathemic-client.workspace = true
+anyhow.workspace = true
+axum = "0.8"
+clap.workspace = true
+hex.workspace = true
+librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+yosemite = { version = "0.7", features = ["async-extra"] }

@@ -40,6 +40,17 @@ pub fn member_key(home: &Path, root: &PublicKey) -> anyhow::Result<(SecretKey, b
     Ok((key, true))
 }
 
+/// The folder a site's sealed epochs are kept in, which a node seeds from
+pub fn cache_dir(home: &Path, root: &PublicKey) -> PathBuf {
+    home.join("cache").join(root.to_hex())
+}
+
+/// Where a sealed epoch is kept: named as in its torrent, so a node can seed the same file
+pub fn cache_path(home: &Path, root: &PublicKey, board: &str, epoch: u64) -> PathBuf {
+    debug_assert!(valid_board_name(board));
+    cache_dir(home, root).join(anathemic_core::torrent::file_name(board, epoch))
+}
+
 pub struct Client {
     agent: ureq::Agent,
     base: String,
@@ -89,7 +100,7 @@ impl Client {
             let bundle = match fs::read(&cached) {
                 Ok(bundle) if open_bundle(&bundle, sealed).is_ok() => bundle,
                 _ => {
-                    let bundle = self.get(&format!("/boards/{board}/epochs/{}", sealed.epoch))?;
+                    let bundle = self.fetch_bundle(board, sealed.epoch)?;
                     fs::create_dir_all(cached.parent().expect("cache files are in a folder"))?;
                     fs::write(&cached, &bundle)?;
                     bundle
@@ -130,8 +141,22 @@ impl Client {
     }
 
     pub fn cache_path(&self, root: &PublicKey, board: &str, epoch: u64) -> PathBuf {
-        debug_assert!(valid_board_name(board));
-        self.home.join("cache").join(root.to_hex()).join(board).join(format!("{epoch}.zst"))
+        cache_path(&self.home, root, board, epoch)
+    }
+
+    /// The server's address, as given
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// A sealed epoch's torrent file, from the server
+    pub fn fetch_torrent(&self, board: &str, epoch: u64) -> anyhow::Result<Vec<u8>> {
+        self.get(&format!("/boards/{board}/epochs/{epoch}/torrent"))
+    }
+
+    /// A sealed epoch's bundle, from the server
+    pub fn fetch_bundle(&self, board: &str, epoch: u64) -> anyhow::Result<Vec<u8>> {
+        self.get(&format!("/boards/{board}/epochs/{epoch}"))
     }
 
     /// Server address → (pinned root key, highest manifest sequence seen)
