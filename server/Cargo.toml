@@ -10,6 +10,7 @@ anathemic-core.workspace = true
 anyhow.workspace = true
 axum = "0.8"
 clap.workspace = true
+serde.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
@@ -17,3 +18,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"]
 [dev-dependencies]
 anathemic-client.workspace = true
 tempfile = "3"
+ureq = "2"

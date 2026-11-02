@@ -14,8 +14,12 @@ core:
 - **The client** checks every signature and the hash chain, keeps a separate member key for each
   site, pins each site's root key on first contact, caches sealed epochs, and posts. Boards show
   authors, hide them, or let posters choose.
+- **Web pages** for reading a site in rynx or any other browser: the boards, each board's threads
+  and each thread, in plain HTML with no JavaScript. The server draws them from its own records,
+  so unlike the client they don't check signatures.
 
-Not yet: mirroring between members, moderation, media, tags, a full client UI.
+Not yet: posting from a browser, mirroring between members, moderation, media, tags, a full
+client UI.
 
 ## Trying it
 
@@ -33,6 +37,8 @@ target/release/anathemic-client --direct post http://127.0.0.1:8470 general --th
 target/release/anathemic-client --direct read http://127.0.0.1:8470 general
 target/release/anathemic-client --direct read http://127.0.0.1:8470 general --thread 1
 ```
+
+Then open `http://127.0.0.1:8470/` in rynx (or any browser) to read the site.
 
 For quick tests, `serve --epoch-posts 2 --window-seconds 10 --tick-seconds 1` seals epochs
 within seconds. By default epochs close at 500 posts or 7 days, and seal 72 hours later.
@@ -57,6 +63,8 @@ Clients reach it through the router's HTTP proxy, which they use by default
 ```sh
 anathemic-client read http://<the tunnel's address>.b32.i2p general
 ```
+
+rynx reads the same address through the router, in I2P mode.
 
 ## License
 

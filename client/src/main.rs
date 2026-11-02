@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Read, path::PathBuf};
 
-use anathemic_client::{Client, member_key, utc};
-use anathemic_core::{Content, Post};
+use anathemic_client::{Client, member_key};
+use anathemic_core::{Content, Post, utc};
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 

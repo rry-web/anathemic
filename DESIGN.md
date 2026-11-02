@@ -17,7 +17,7 @@ Settled before the prototype (2026-11-02):
 | Forum shape | Traditional forum: boards hold titled threads, replies are listed in order, and nothing expires |
 | Who sees a post's author | Per board, set by the operator: always shown, never shown (the server still knows), or the poster's choice |
 | Client–server protocol | Plain HTTP, served inside I2P through an i2pd server tunnel |
-| Post markup | A small Markdown subset, rendered by the client; never HTML |
+| Post markup | A small Markdown subset, rendered by the client; never HTML (see [Post markup](#post-markup)) |
 | Accounts | The prototype has anonymous accounts: a key pair with no name or recovery. Recovery phrases and names come later, and operators can handle much of it |
 | Private boards | Later: invitation-only boards whose epochs are encrypted for members, so mirrors hold only ciphertext. The formats leave room for it |
 | Formats | Anathemic's own (CBOR, ed25519), not Nostr events. Nostr's habit of one key per person everywhere works against anonymity, and its clients can't reach I2P. Members use a separate key per site. A bridge to Nostr can come later if people want one |
@@ -120,6 +120,18 @@ therefore a hash chain, so a mirror can't drop or reorder epochs without being n
 Threads cross epochs: a reply in epoch 9 can point to its parent in epoch 3. Epochs are a
 storage unit, not a page of the forum. The client builds thread views from whatever epochs it
 holds and fetches any it's missing.
+
+### Post markup
+
+Posts are written in a small Markdown subset, parsed by `anathemic-core` so every client reads
+it the same way. Anything that isn't markup is text; HTML in a post is shown as written.
+
+- Blocks: paragraphs separated by blank lines (single line breaks are kept), quotes (lines
+  starting with `>`), lists (lines starting with `- ` or `* `) and code between fences of three
+  backticks.
+- Within a line: `` `code` ``, `**strong**`, `*emphasis*`, `>>12` (a link to post 12 on the
+  same board; a line starting with one is not a quote), and `http://` or `https://` addresses. A
+  backslash before a markup character keeps it as text.
 
 ### Links
 
@@ -453,7 +465,9 @@ mirrored epochs.
 The Pi can run phases 1 and 2 as a test node from the start.
 
 Phase 1 has a working prototype: the server, the command-line client and the formats in
-`anathemic-core`, with tests that run a real server on localhost.
+`anathemic-core`, with tests that run a real server on localhost. Read support in rynx came
+early, as web pages the server draws (`/`, `/<board>/`, `/<board>/<thread>`), because rynx is
+the client most testing happens in.
 
 ## Open questions
 

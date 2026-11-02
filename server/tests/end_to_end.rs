@@ -134,3 +134,67 @@ fn members_have_a_key_per_site() {
     let (other, _) = anathemic_client::member_key(&home, &second.site.root()).unwrap();
     assert_ne!(other.public(), one.public());
 }
+
+fn get_page(url: &str) -> (u16, String, Option<String>) {
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let response = match agent.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(e) => panic!("{e}"),
+    };
+    let status = response.status();
+    let csp = response.header("content-security-policy").map(str::to_string);
+    let location = response.header("location").map(str::to_string);
+    let body = response.into_string().unwrap();
+    (status, if status / 100 == 3 { location.unwrap_or_default() } else { body }, csp)
+}
+
+#[test]
+fn web_pages_show_the_site_without_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("site"));
+    let client = Client::new(&server.url, None, dir.path().join("home")).unwrap();
+    let key = SecretKey::generate();
+    client.submit(&key, "general", thread("Tags & <things>", "Hello **world**"), false).unwrap();
+    client.submit(&key, "general", reply(1, "<script>alert(1)</script>\n> quoted\n\nsee >>1"), true).unwrap();
+    client.submit(&key, "general", thread("Second", "a reply to >>2 from elsewhere"), false).unwrap();
+
+    let (status, index, csp) = get_page(&server.url);
+    assert_eq!(status, 200);
+    assert!(csp.unwrap().contains("default-src 'none'"));
+    assert!(index.contains("<a href=\"/general/\">/general/</a> General"), "{index}");
+
+    let (status, board, _) = get_page(&format!("{}/general/", server.url));
+    assert_eq!(status, 200);
+    assert!(board.contains("Tags &amp; &lt;things&gt;"), "{board}");
+    // The most recently active thread comes first
+    assert!(board.find("Second").unwrap() < board.find("Tags &amp;").unwrap());
+
+    let (status, page, _) = get_page(&format!("{}/general/1", server.url));
+    assert_eq!(status, 200);
+    assert!(page.contains("Hello <strong>world</strong>"), "{page}");
+    assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{page}");
+    assert!(!page.contains("<script"), "{page}");
+    assert!(page.contains("<blockquote>quoted</blockquote>"), "{page}");
+    assert!(page.contains("<a href=\"#p1\">&gt;&gt;1</a>"), "{page}");
+    assert!(page.contains("Anonymous"), "{page}");
+    assert!(page.contains(&key.public().fingerprint()), "{page}");
+
+    let (_, other, _) = get_page(&format!("{}/general/3", server.url));
+    assert!(other.contains("<a href=\"/general/post/2\">&gt;&gt;2</a>"), "{other}");
+    assert_eq!(get_page(&format!("{}/general/post/2", server.url)).1, "/general/1#p2");
+    assert_eq!(get_page(&format!("{}/general/2", server.url)).1, "/general/1#p2");
+    assert_eq!(get_page(&format!("{}/general", server.url)).1, "/general/");
+
+    assert_eq!(get_page(&format!("{}/general/99", server.url)).0, 404);
+    assert_eq!(get_page(&format!("{}/nowhere/", server.url)).0, 404);
+    assert_eq!(get_page(&format!("{}/general/?page=5", server.url)).0, 404);
+    assert_eq!(get_page(&format!("{}/bad%0Aname", server.url)).0, 404);
+}
+
+#[test]
+fn reserved_board_names_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    init(dir.path()).unwrap();
+    assert!(add_board(dir.path(), "manifest", "Clash", Authors::Choice).is_err());
+}

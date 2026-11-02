@@ -2,6 +2,7 @@
 //! manifest, epochs and posts over plain HTTP (inside I2P, through an i2pd server tunnel).
 
 use std::{
+    collections::HashMap,
     fs,
     net::SocketAddr,
     path::Path,
@@ -11,7 +12,7 @@ use std::{
 
 use anathemic_core::{
     Authors, BoardEntry, Context, Epoch, FORMAT, Hash32, Manifest, Post, PublicKey, SealedRef,
-    SecretKey, Signed, SiteCert, Submission, cbor, epoch, now, valid_board_name,
+    SecretKey, Signed, SiteCert, Submission, Time, cbor, epoch, now, valid_board_name,
 };
 use anyhow::{Context as _, bail};
 use axum::{
@@ -24,6 +25,8 @@ use axum::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+
+pub mod web;
 
 const ROOT_KEY: &str = "root.key";
 const SITE_KEY: &str = "site.key";
@@ -79,6 +82,9 @@ pub fn init(dir: &Path) -> anyhow::Result<PublicKey> {
 pub fn add_board(dir: &Path, name: &str, title: &str, authors: Authors) -> anyhow::Result<()> {
     if !valid_board_name(name) {
         bail!("board names are 1 to 32 of a-z, 0-9 and '-'");
+    }
+    if web::RESERVED.contains(&name) {
+        bail!("/{name}/ is one of the server's own addresses");
     }
     let db = Connection::open(dir.join(DATABASE))?;
     let position: i64 = db.query_row("select count(*) from boards", [], |r| r.get(0))?;
@@ -151,6 +157,7 @@ impl Site {
     pub fn open(dir: &Path, config: Config) -> anyhow::Result<Site> {
         let key = SecretKey::from_bytes(&fs::read(dir.join(SITE_KEY))?)?;
         let db = Connection::open(dir.join(DATABASE))?;
+        db.execute_batch("create index if not exists posts_by_thread on posts(board, thread, number);")?;
         let meta = |name: &str| -> anyhow::Result<Vec<u8>> {
             Ok(db.query_row("select value from meta where key = ?1", [name], |r| r.get(0))?)
         };
@@ -337,6 +344,164 @@ impl Site {
     }
 }
 
+/// A board as the web pages list it
+pub struct BoardSummary {
+    pub name: String,
+    pub title: String,
+    pub authors: Authors,
+    pub threads: u64,
+    pub posts: u64,
+    /// When its newest post was accepted
+    pub last: Option<Time>,
+}
+
+/// A thread as a board's page lists it
+pub struct ThreadSummary {
+    pub start: Post,
+    pub replies: u64,
+    /// When its newest post was accepted
+    pub last: Time,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochState {
+    Open,
+    Settling,
+    Sealed,
+}
+
+/// Reading the site for its web pages. The server's own records are trusted, so these don't
+/// check signatures.
+impl Site {
+    pub fn boards(&self) -> Result<Vec<BoardSummary>, Fail> {
+        let db = self.db();
+        let rows: Vec<(String, String, String, i64, i64)> = db
+            .prepare(
+                "select name, title, authors,
+                        (select count(*) from posts where board = name and thread is null),
+                        (select count(*) from posts where board = name)
+                 from boards order by position",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<Result<_, _>>()?;
+        rows.into_iter()
+            .map(|(name, title, authors, threads, posts)| {
+                let last = latest(&db, &name, None)?.map(|post| post.accepted);
+                Ok(BoardSummary { authors: parse_authors(&authors)?, name, title, threads: threads as u64, posts: posts as u64, last })
+            })
+            .collect()
+    }
+
+    /// A board's title and author rule
+    pub fn board(&self, board: &str) -> Result<(String, Authors), Fail> {
+        let (title, authors): (String, String) = self
+            .db()
+            .query_row("select title, authors from boards where name = ?1", [board], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or(Fail::NotFound)?;
+        Ok((title, parse_authors(&authors)?))
+    }
+
+    /// A page of a board's threads, the most recently active first, and how many there are
+    pub fn threads(&self, board: &str, skip: u64, take: u64) -> Result<(Vec<ThreadSummary>, u64), Fail> {
+        self.board(board)?;
+        let db = self.db();
+        let total: i64 =
+            db.query_row("select count(*) from posts where board = ?1 and thread is null", [board], |r| r.get(0))?;
+        // Post numbers rise with time, so the highest number is the newest post
+        let rows: Vec<(Vec<u8>, i64, i64)> = db
+            .prepare(
+                "select s.record, count(r.number), coalesce(max(r.number), s.number) as last
+                 from posts s left join posts r on r.board = s.board and r.thread = s.number
+                 where s.board = ?1 and s.thread is null
+                 group by s.number order by last desc limit ?2 offset ?3",
+            )?
+            .query_map(params![board, take as i64, skip as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut threads = Vec::new();
+        for (record, replies, last) in rows {
+            let start = decode(&record)?;
+            let last = if last as u64 == start.number {
+                start.accepted
+            } else {
+                latest(&db, board, Some(last as u64))?.map_or(start.accepted, |post| post.accepted)
+            };
+            threads.push(ThreadSummary { start, replies: replies as u64, last });
+        }
+        Ok((threads, total as u64))
+    }
+
+    /// A thread's posts in order, its first post first
+    pub fn thread(&self, board: &str, number: u64) -> Result<Vec<Post>, Fail> {
+        let db = self.db();
+        let records: Vec<Vec<u8>> = db
+            .prepare(
+                "select record from posts where board = ?1 and (number = ?2 and thread is null or thread = ?2)
+                 order by number",
+            )?
+            .query_map(params![board, number as i64], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if records.is_empty() {
+            return Err(Fail::NotFound);
+        }
+        records.iter().map(|record| decode(record)).collect()
+    }
+
+    /// The thread a post belongs to
+    pub fn thread_of(&self, board: &str, number: u64) -> Result<u64, Fail> {
+        let thread: i64 = self
+            .db()
+            .query_row(
+                "select coalesce(thread, number) from posts where board = ?1 and number = ?2",
+                params![board, number as i64],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(Fail::NotFound)?;
+        Ok(thread as u64)
+    }
+
+    pub fn epoch_states(&self, board: &str) -> Result<HashMap<u64, EpochState>, Fail> {
+        let db = self.db();
+        let rows: Vec<(i64, String)> = db
+            .prepare("select number, state from epochs where board = ?1")?
+            .query_map([board], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(number, state)| {
+                let state = match state.as_str() {
+                    "sealed" => EpochState::Sealed,
+                    "settling" => EpochState::Settling,
+                    _ => EpochState::Open,
+                };
+                (number as u64, state)
+            })
+            .collect())
+    }
+}
+
+fn parse_authors(name: &str) -> Result<Authors, Fail> {
+    Authors::parse(name).ok_or_else(|| Fail::Internal(format!("bad authors {name}")))
+}
+
+fn decode(record: &[u8]) -> Result<Post, Fail> {
+    let signed: Signed<Post> = cbor::from_slice(record).map_err(|e| Fail::Internal(e.to_string()))?;
+    signed.peek().map_err(|e| Fail::Internal(e.to_string()))
+}
+
+/// A board's newest post, or a given one
+fn latest(db: &Connection, board: &str, number: Option<u64>) -> Result<Option<Post>, Fail> {
+    let record: Option<Vec<u8>> = db
+        .query_row(
+            "select record from posts where board = ?1 and (?2 is null or number = ?2) order by number desc limit 1",
+            params![board, number.map(|n| n as i64)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    record.map(|record| decode(&record)).transpose()
+}
+
 fn load_posts(db: &Connection, board: &str, epoch: u64) -> Result<Vec<Signed<Post>>, Fail> {
     let records: Vec<Vec<u8>> = db
         .prepare("select record from posts where board = ?1 and epoch = ?2 order by number")?
@@ -419,6 +584,7 @@ pub fn router(site: Arc<Site>) -> Router {
         .route("/boards/{board}/epochs/{number}", get(get_bundle))
         .route("/boards/{board}/epochs/{number}/posts", get(get_posts))
         .route("/boards/{board}/posts", post(post_submission))
+        .merge(web::routes())
         .with_state(site)
 }
 
