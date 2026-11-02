@@ -1,8 +1,9 @@
-# swarmboard design (draft)
+# Anathemic design (draft)
 
-*Working name. Status: draft for discussion; nothing here is built yet.*
+*Status: draft for discussion; nothing here is built yet.*
 
-swarmboard is forum software for I2P where one operator runs the site and its members mirror it.
+Anathemic is software for running **swarmboards**: forums on I2P where one operator runs the site
+and its members mirror it.
 Text travels only over I2P. Images and video travel over I2P or clearnet BitTorrent, board by
 board, as the operator chooses. Old pages are frozen, hashed and signed, so any mirror can serve
 them and a link to an old post keeps working even when the operator's server is down.
@@ -36,6 +37,7 @@ them and a link to an old post keeps working even when the operator's server is 
 |---|---|
 | **Operator** | Owns the site's root key, runs the server (the only writer), seals epochs, appoints moderators |
 | **Moderator** | Holds a key the operator certified, with a scope (boards) and an expiry. Can hide, revoke and ban within that scope |
+| **Tag gardener** | A moderator whose certificate grants only the `tags` power: merges, aliases, implications, locks and reverts (see [Tags](#tags)) |
 | **Member** | Has a key, can post, and must seed a quota (see [Seeding](#the-seeding-obligation)) |
 | **Reader** | Reads without a key, seeds nothing, can't post |
 | **Mirror** | Any node holding sealed epochs: members' clients, a member's home node (such as a Raspberry Pi), volunteers |
@@ -92,7 +94,7 @@ holds and fetches any it's missing.
 ### Links
 
 ```
-sb://<root-fingerprint>/<board>/<epoch>/<post-number>
+anathemic://<root-fingerprint>/<board>/<epoch>/<post-number>
 ```
 
 A link to a sealed epoch resolves from any mirror and is checked against the hash chain. A link
@@ -261,14 +263,54 @@ The links between layers, and what closes each one:
 6. **Copyright notices to tier 2 seeders.** Not technically closable. Seeding on tier 2 is
    opt-in, with a notice, and revoked hashes stop seeding at once.
 
-## Tags (later)
+## Tags
 
-Community tags are signed claims, `{target, tag, author key, time}`, in a format like Nostr's
-labelling events (NIP-32). They are published separately from the content and can be ignored.
+Tagging follows the image booru model (Danbooru, Gelbooru, e621), which has kept very large
+collections searchable for years. The site keeps **one canonical set of tags**, curated by its
+members and gardeners, rather than every viewer trusting different taggers.
 
-The client filters by trust, never by raw counts. It shows tags from moderators, from people the
-user follows, and from people those vouch for, to a depth the user chooses. Sybil accounts can
-add tags, but nobody's filter will count them.
+### The model
+
+- **Namespaces:** `creator:`, `series:`, `character:`, `meta:` (such as `animated`, `translated`,
+  `low_res`) and general tags with no prefix.
+- **Rating, required on every media post:** `rating:safe`, `rating:questionable` or
+  `rating:explicit`. A post can't be accepted without one, and moderators can correct it.
+- **Aliases:** `cat_girl` → `catgirl`. Searching or tagging with an alias uses the canonical tag.
+- **Implications:** `kitten` → `cat` → `animal`. Adding a tag adds what it implies.
+- **Wiki pages:** each tag can have a page saying what it means and when to use it. Those pages
+  are what keep a booru's tags consistent.
+- **Locks:** gardeners can lock a post's tags, or a tag itself, against edits by ordinary
+  members.
+- **Votes and favourites (optional per site):** rate limited, used only for sorting. They never
+  grant anyone rights.
+
+### Edits
+
+- A tag edit is a signed event, `{post, added, removed, author key, time}`, sent to the server
+  over I2P.
+- The server applies it according to the author's standing. New members get a few edits a day,
+  or have them queued for a gardener. Established members' edits apply at once.
+- Every edit is kept, so any change can be reverted, and gardeners can revert everything one
+  key ever did in a single action. That is the main defence against floods of generated edits.
+- Alias, implication and wiki changes are proposals that a gardener approves.
+
+### Distribution
+
+Tags change after an epoch seals, so they can't live inside the sealed epoch. The server keeps
+an append-only, signed **tag log** and publishes periodic signed **snapshots** of the whole tag
+state. The manifest names the latest snapshot. Snapshots are mirrored like epochs, and clients
+apply the log entries that came after them.
+
+### Search and filtering
+
+- **Searching happens on the client,** against its copy of the tag snapshot, so the server never
+  sees what anyone searches for. A tag snapshot is small next to the media it describes: a
+  million posts with 20 tags each should compress to tens of MB.
+- **Booru query syntax:** `cat -dog rating:safe creator:someone order:new`.
+- **Blacklists** are kept by each client: posts with blacklisted tags are hidden, and their
+  media is not fetched. `rating:explicit` is on the default blacklist.
+- **Overlays (later):** other people's tag sets, published as signed label events (in the style
+  of Nostr's NIP-32), can be layered over the canonical set, filtered by whom the user trusts.
 
 ## Off-the-shelf parts
 
@@ -284,9 +326,66 @@ add tags, but nobody's filter will count them.
 | Video re-encoding | ffmpeg (external) | tier 2 only |
 | Perceptual hashing | pHash or PDQ | PDQ is open and built for this |
 | Proof of work | SHA-256 puzzles (as in ALTCHA) | |
-| Tags | NIP-32 style events | |
+| Tag search | client-side index (SQLite FTS or tantivy) over the tag snapshot | |
+| Tag overlays | NIP-32 style events | later |
 
 Rust throughout, to match rynx and so one client can run on desktops, a Pi and the glasses.
+
+## Capacity
+
+What happens to speeds if many members run nodes with high bandwidth caps. These are
+estimates for planning, to be replaced by measurements from the test network.
+
+### How I2P spends bandwidth
+
+A message between two I2P peers goes through the sender's outbound tunnel and the receiver's
+inbound tunnel, at 3 hops each by default. Each byte is therefore sent about 7 times, 6 of them
+by routers relaying for others. Encryption, fragmentation and tunnel building add roughly another
+10–30%. As a rule of thumb, **every 1 MB/s of useful transfer uses about 7–8 MB/s of upload
+across the network.**
+
+### Network-wide capacity
+
+Members' routers relay traffic for the whole I2P network, not only for the swarmboard. But what
+they add to the network's capacity is roughly what members can take out of it. If each member's
+router shares about 1 MB/s (8 Mbit/s of upload, which is common on cable and fibre):
+
+| Members running nodes | Shared upload | Useful transfer it pays for |
+|---|---|---|
+| 100 | ~100 MB/s | ~13 MB/s |
+| 1,000 | ~1 GB/s | ~130 MB/s |
+| 10,000 | ~10 GB/s | ~1.3 GB/s |
+
+The whole I2P network is tens of thousands of routers, most of them sharing far less than
+1 MB/s. A thousand fast routers would therefore be a meaningful addition to its fast tier.
+
+### Speed per download
+
+Total capacity is not what one person sees. Two limits matter more:
+
+- **Each stream is limited by latency.** A round trip across 6 hops takes from about 1 second
+  to several. The streaming protocol only has a limited amount of data in flight per round trip,
+  so one stream tops out at roughly 100–300 KB/s however fast the routers are. Fast routers make
+  that ceiling more reliable (I2P picks fast peers for tunnels), but they don't raise it much.
+- **Swarming multiplies streams.** A torrent pulls from many seeders at once, each over its own
+  tunnels. A download from 10 seeders can reach about 1–3 MB/s, so **the number of mirrors per
+  epoch matters more than the size of the network.** This is what the seeding quota buys.
+
+At those speeds, a tier 1 epoch of 500 posts with 200 KB images (about 100 MB) takes 1–5 minutes
+from a healthy swarm. That is fine for fetching in the background, and a single image (one stream,
+about 1–2 s) is fine to view on demand from the server.
+
+### Levers
+
+- **Shorter tunnels for media:** the operator could set 2-hop tunnels for tier 1 media torrents,
+  meaning 4 relays instead of 6. That gives about 1.5× the useful transfer and lower latency,
+  at some cost to anonymity. Text and posting would stay at 3 hops.
+- **High bandwidth defaults:** the server and home-node packages ship the config below.
+- **Keeping nodes up:** a router that runs all the time builds a better reputation with its
+  peers and gets chosen for more tunnels. Home nodes (Pis) are worth more than desktops that
+  come and go.
+- **Clearnet tier 2:** large files belong on tier 2, where one swarm can reach the full speed of
+  the members' connections.
 
 ## Node defaults
 
@@ -313,7 +412,7 @@ mirrored epochs.
 4. **Tier 1 media:** the upload pipeline, I2P media torrents, the seeding quota and challenges.
 5. **Tier 2 media:** seedboxes, clearnet torrents, the delays and notices.
 6. **The dedicated client UI**, and read support in rynx.
-7. **Tags.**
+7. **Tags:** first the canonical tag log, snapshots and client-side search; overlays later.
 
 The Pi can run phases 1 and 2 as a test node from the start.
 
@@ -329,4 +428,5 @@ The Pi can run phases 1 and 2 as a test node from the start.
   accountability that seeding is meant to buy?
 - **Video on tier 1:** never, or short low-resolution clips under a size cap?
 - **Server-side search:** on the server only, or a search index shipped with each sealed epoch?
-- **Name:** "swarmboard" is a placeholder.
+- **Tiers versus ratings:** should `rating:explicit` media be allowed on tier 2 at all, given
+  that clearnet swarms are public?
