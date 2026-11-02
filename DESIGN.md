@@ -20,6 +20,7 @@ Settled before the prototype (2026-11-02):
 | Post markup | A small Markdown subset, rendered by the client; never HTML |
 | Accounts | The prototype has anonymous accounts: a key pair with no name or recovery. Recovery phrases and names come later, and operators can handle much of it |
 | Private boards | Later: invitation-only boards whose epochs are encrypted for members, so mirrors hold only ciphertext. The formats leave room for it |
+| Formats | Anathemic's own (CBOR, ed25519), not Nostr events. Nostr's habit of one key per person everywhere works against anonymity, and its clients can't reach I2P. Members use a separate key per site. A bridge to Nostr can come later if people want one |
 | License | AGPL-3.0-or-later |
 | Code layout | A Rust workspace: `anathemic-core` (formats, signatures, verification), `anathemic-server`, `anathemic-client` (command line first) and later `anathemic-node` (seeding). The server keeps its state in SQLite |
 | JavaScript | None, anywhere. Any web pages are HTML and CSS rendered by the server, so rynx and other text browsers can read them |
