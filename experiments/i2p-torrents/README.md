@@ -28,7 +28,9 @@ over about an hour as the router warmed up.
 | Route | Runs | Rate (KB/s) | Start |
 |---|---|---|---|
 | libtorrent → libtorrent | 4 | 215, 31, 100, 36 | 29–82 s (new sessions, then the first announce) |
-| librqbit (bridge) ← libtorrent | 3 of 4 (one stalled) | 454, 160, 215 | 12 s, then 148 s and 131 s |
+| librqbit (bridge, connecting one peer at a time) ← libtorrent | 3 of 4 (one stalled) | 454, 160, 215 | 12 s, then 148 s and 131 s |
+| librqbit (bridge, connecting in parallel) ← libtorrent | 4 of 4 | 108, 182, 46, 303 | 43 s, then 17, 14, 14 s, with 1–3 dead peers listed |
+| librqbit (bridge in parallel, I2P-paced timeouts) ← libtorrent | 4 of 4 | 282, 409, 327, 170 | 24 s, then 9, 11, 11 s, with 1–3 dead peers listed |
 | Plain SAM stream, one | 3 | 120, 129, 111 | first connect 0.6–17 s; round trips 1.1–2.5 s |
 | Plain SAM streams, four at once to one peer | 3 | 80, 99, 76 (together) | |
 
@@ -40,11 +42,24 @@ What they show:
   speed has to come from more peers. That is what the seeding quota buys.
 - **Starting is slow:** new SAM sessions take 10–60 s to build tunnels. Nodes should keep one
   long-lived session with a saved destination key, not start one per download.
-- **librqbit's slow starts were the bridge's fault, not librqbit's.** The test bridge connects to
-  one peer at a time under a lock, so a dead peer the tracker still lists (left over from an
-  earlier run) holds up the live one until SAM gives up on it. The stalled run was librqbit's
-  clearnet timeouts closing slow I2P connections. Both are fixable: connect in parallel, and set
-  librqbit's `PeerConnectionOptions` timeouts to I2P's pace.
+- **librqbit's slow starts were the bridge's fault, not librqbit's.** The first bridge connected
+  to one peer at a time under a lock, so a dead peer the tracker still listed (left over from an
+  earlier run) held up the live one until SAM gave up on it. With connects in parallel
+  (yosemite's `connect_detached`, holding the lock only to start each one, and a 60 s limit),
+  the first byte came 14–17 s after the tracker replied, even with up to three dead peers
+  listed. (Run 1's 43 s was the seeder's first connection on a newly started router.) Speed
+  once data flowed didn't change: it is still whatever the tunnels give. - **librqbit's clearnet timeouts drop I2P peers.** By default it allows 10 s to connect and
+  handshake and 10 s for each message, and sends keep-alives every 120 s, so a live I2P peer that
+  pauses for a few seconds gets dropped. That caused the earlier stalled run. `rqtest` now sets
+  `PeerConnectionOptions` on the torrent: 90 s to connect (longer than the bridge's 60 s SAM
+  connect, which happens inside librqbit's handshake), 120 s per message, and keep-alives every
+  30 s. With those settings the bridge opened each peer once per run. Before, it reopened the
+  seeder two or three times per run as librqbit dropped it. All four runs finished, at an
+  average of 297 KB/s against 160 KB/s before. That is only four runs on one router, and
+  I2P speeds vary a lot, so treat the gain as likely rather than measured.
+- i2pd's SAM can say a stream is open before the far end has answered, so "open" in the bridge
+  log doesn't prove a peer is alive; dead peers either fail later (`CantReachPeer`) or just
+  never send data.
 - Both ends ran on one router, but traffic still went through full tunnels (the 1–2 s round
   trips show it), so this is close to two routers.
 
@@ -60,9 +75,9 @@ What they show:
    I2PSnark, BiglyBT), not only Anathemic's.
 3. **`anathemic-node` uses librqbit with a SAM bridge built on `yosemite`.** That keeps
    everything in Rust, so it builds for the Pi and the glasses like rynx does, and it was the
-   fastest here once data flowed. The bridge needs parallel connects, a way in for seeding (SAM
-   accepts forwarded to librqbit's listening port), I2P-paced timeouts, and DHT and local
-   discovery switched off. [rqbit#361](https://github.com/ikatson/rqbit/issues/361) asks for
+   fastest here once data flowed. The bridge needs parallel connects and I2P-paced timeouts
+   (both now in `rqtest`), a way in for seeding (SAM accepts forwarded to librqbit's listening
+   port), and DHT and local discovery switched off. [rqbit#361](https://github.com/ikatson/rqbit/issues/361) asks for
    I2P upstream, and someone has done the same bridge in
    [YGGverse/btracker](https://github.com/YGGverse/btracker/tree/main/crates/crawler), so it
    could become a contribution to librqbit.

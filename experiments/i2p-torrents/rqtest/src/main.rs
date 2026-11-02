@@ -2,7 +2,7 @@
 //! SAM stream, then give librqbit a local TCP port for each I2P peer, each forwarded to a SAM
 //! stream. Usage: rqtest <sam port> <torrent file> <tracker b32 host> <output dir>
 use std::{sync::Arc, time::{Duration, Instant}};
-use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, Session as Rq, SessionOptions as RqOptions};
+use librqbit::{PeerConnectionOptions, AddTorrent, AddTorrentOptions, AddTorrentResponse, Session as Rq, SessionOptions as RqOptions};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::Mutex};
 use yosemite::{style::Stream, Session, SessionOptions};
 
@@ -18,6 +18,19 @@ fn bstring<'a>(data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     data.get(colon + 1..colon + 1 + len)
 }
 
+/// librqbit's defaults suit the clearnet: 10 s to connect and handshake, 10 s for each message,
+/// keep-alives every 120 s. Over I2P a round trip is 1–2.5 s, tunnels stall for seconds at a
+/// time, and the bridge's SAM connect (up to 60 s) happens inside librqbit's handshake, so a
+/// live peer that pauses gets dropped.
+const I2P_PACE: PeerConnectionOptions = PeerConnectionOptions {
+    // Longer than the bridge's 60 s SAM connect, so the bridge decides when a peer is dead
+    connect_timeout: Some(Duration::from_secs(90)),
+    // A quiet peer is dropped after this; keep-alives below keep live ones talking
+    read_write_timeout: Some(Duration::from_secs(120)),
+    keep_alive_interval: Some(Duration::from_secs(30)),
+    max_request_window: None,
+};
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -30,14 +43,14 @@ async fn main() -> anyhow::Result<()> {
     let start = torrent.windows(6).position(|w| w == b"4:info").unwrap() + 6;
     let info_hash: [u8; 20] = sha1(&torrent[start..torrent.len() - 1]);
 
-    let options = SessionOptions { samv3_tcp_port: port, nickname: "rqbit-bridge".into(), ..Default::default() };
+    let options = SessionOptions { samv3_tcp_port: port, nickname: format!("rqbit-bridge-{}", std::process::id()), ..Default::default() };
     let sam = Arc::new(Mutex::new(Session::<Stream>::new(options).await?));
     log("SAM session up".into());
 
     // Announce, over a SAM stream; the tracker learns our destination from the tunnel
     let peers = loop {
         let attempt = async {
-            let mut stream = sam.lock().await.connect(&tracker).await?;
+            let mut stream = sam.lock().await.connect_detached(&tracker).await?;
             let request = format!(
                 "GET /announce?info_hash={}&peer_id=-RQ0001-anathemic01&port=6881&uploaded=0&downloaded=0&left=1&compact=1&event=started HTTP/1.0\r\nHost: {tracker}\r\nConnection: close\r\n\r\n",
                 escape(&info_hash)
@@ -75,13 +88,16 @@ async fn main() -> anyhow::Result<()> {
                 let peer = peer.clone();
                 tokio::spawn(async move {
                     let started = Instant::now();
-                    let stream = sam.lock().await.connect(&peer).await;
-                    match stream {
-                        Ok(mut i2p) => {
+                    // Take the lock only to start the connect, so a dead peer doesn't hold up
+                    // the others; give up on it after a minute
+                    let connect = sam.lock().await.connect_detached(&peer);
+                    match tokio::time::timeout(Duration::from_secs(60), connect).await {
+                        Err(_) => println!("  bridge to {}… timed out", &peer[..10]),
+                        Ok(Err(e)) => println!("  bridge to {}… failed: {e}", &peer[..10]),
+                        Ok(Ok(mut i2p)) => {
                             println!("  bridge to {}… open after {:.1}s", &peer[..10], started.elapsed().as_secs_f64());
                             let _ = tokio::io::copy_bidirectional(&mut tcp, &mut i2p).await;
                         }
-                        Err(e) => println!("  bridge to {}… failed: {e}", &peer[..10]),
                     }
                 });
             }
@@ -92,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         dht: None, disable_trackers: true, disable_local_service_discovery: true, listen: None, ..Default::default()
     }).await?;
     let opts = AddTorrentOptions {
-        initial_peers: Some(initial), disable_trackers: true, overwrite: true, output_folder: Some(out), ..Default::default()
+        initial_peers: Some(initial), peer_opts: Some(I2P_PACE), disable_trackers: true, overwrite: true, output_folder: Some(out), ..Default::default()
     };
     let handle = match rq.add_torrent(AddTorrent::from_bytes(torrent.clone()), Some(opts)).await? {
         AddTorrentResponse::Added(_, handle) => handle,
