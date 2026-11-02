@@ -19,18 +19,18 @@ use anathemic_core::{
 };
 use anyhow::{Context as _, anyhow, bail};
 
-const MEMBER_KEY: &str = "member.key";
 const SITES: &str = "sites.txt";
 /// Larger responses are refused
 const MAX_RESPONSE: u64 = 300 << 20;
 
-/// The member key in `home`, made on first use
-pub fn member_key(home: &Path) -> anyhow::Result<(SecretKey, bool)> {
-    let path = home.join(MEMBER_KEY);
+/// Your member key for the site with this root key, made on first use. Each site gets its own,
+/// so sites can't link your posts to each other.
+pub fn member_key(home: &Path, root: &PublicKey) -> anyhow::Result<(SecretKey, bool)> {
+    let path = home.join("keys").join(format!("{}.key", root.to_hex()));
     if path.exists() {
         return Ok((SecretKey::from_bytes(&fs::read(&path)?)?, false));
     }
-    fs::create_dir_all(home)?;
+    fs::create_dir_all(path.parent().expect("key files are in a folder"))?;
     let key = SecretKey::generate();
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);

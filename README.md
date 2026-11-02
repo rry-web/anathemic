@@ -11,8 +11,9 @@ core:
 - **The server** accepts signed posts and closes each board's epochs after a number of posts or
   a length of time. Once an epoch's moderation window is over, the server seals it into a hashed,
   signed bundle. It serves a signed manifest, the bundles and the posts over plain HTTP.
-- **The client** checks every signature and the hash chain, pins each site's root key on first
-  contact, caches sealed epochs, and posts. Boards show authors, hide them, or let posters choose.
+- **The client** checks every signature and the hash chain, keeps a separate member key for each
+  site, pins each site's root key on first contact, caches sealed epochs, and posts. Boards show
+  authors, hide them, or let posters choose.
 
 Not yet: mirroring between members, moderation, media, tags, a full client UI.
 

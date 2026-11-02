@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Where your member key, pinned sites and cached epochs live [default: ~/.anathemic]
+    /// Where your member keys, pinned sites and cached epochs live [default: ~/.anathemic]
     #[arg(long, global = true)]
     home: Option<PathBuf>,
     /// The I2P router's HTTP proxy, needed for .i2p sites
@@ -24,8 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show your member key, making one if you have none
-    Key,
+    /// Show your member key for a site, making one if you have none
+    Key { server: String },
     /// List a site's boards
     Boards { server: String },
     /// List a board's threads, or show one thread
@@ -62,10 +62,11 @@ fn main() -> anyhow::Result<()> {
     };
     let proxy = (!cli.direct).then_some(cli.proxy.as_str());
     match cli.command {
-        Command::Key => {
-            let (key, made) = member_key(&home)?;
+        Command::Key { server } => {
+            let site = Client::new(&server, proxy, home.clone())?.manifest()?;
+            let (key, made) = member_key(&home, &site.manifest.root)?;
             if made {
-                println!("Made a new member key in {}", home.display());
+                println!("Made a new member key for this site");
             }
             println!("{} ({})", key.public().to_hex(), key.public().fingerprint());
         }
@@ -99,11 +100,12 @@ fn main() -> anyhow::Result<()> {
             } else {
                 body
             };
-            let (key, made) = member_key(&home)?;
+            let client = Client::new(&server, proxy, home.clone())?;
+            let site = client.manifest()?;
+            let (key, made) = member_key(&home, &site.manifest.root)?;
             if made {
-                println!("Made a new member key in {}", home.display());
+                println!("Made a new member key for this site");
             }
-            let client = Client::new(&server, proxy, home)?;
             let post = client.submit(&key, &board, Content { thread, title, body }, anonymous)?;
             println!("Posted #{} in epoch {}", post.number, post.epoch);
         }

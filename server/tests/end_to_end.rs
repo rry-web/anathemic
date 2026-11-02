@@ -119,3 +119,18 @@ fn a_different_root_key_at_the_same_address_is_refused() {
     let error = Client::new(&second.url, None, home).unwrap().manifest().unwrap_err();
     assert!(format!("{error:#}").contains("root key"), "{error:#}");
 }
+
+#[test]
+fn members_have_a_key_per_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let first = start(&dir.path().join("first"));
+    let second = start(&dir.path().join("second"));
+    let (one, made) = anathemic_client::member_key(&home, &first.site.root()).unwrap();
+    assert!(made);
+    let (again, made) = anathemic_client::member_key(&home, &first.site.root()).unwrap();
+    assert!(!made);
+    assert_eq!(again.public(), one.public());
+    let (other, _) = anathemic_client::member_key(&home, &second.site.root()).unwrap();
+    assert_ne!(other.public(), one.public());
+}
