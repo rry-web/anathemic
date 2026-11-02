@@ -85,7 +85,8 @@ An epoch passes through three states:
 
 1. **Open:** new posts arrive. Only the server holds it, and clients fetch it from the server.
 2. **Settling:** closed to new posts, but moderators can still remove posts. This is the
-   moderation window (the operator sets it per board; suggested default: 72 hours). Sealing spam immediately would mirror it forever.
+   moderation window (the operator sets it per board; suggested default: 72 hours). Sealing
+   spam immediately would mirror it forever.
 3. **Sealed:** serialised deterministically, compressed, hashed and signed. The epoch is then
    immutable, and any mirror can serve it.
 
