@@ -104,6 +104,8 @@ enum Command {
     },
     /// List the moderators
     Moderators,
+    /// Print the .b32.i2p address of an i2pd tunnel's keys file, such as the site's tunnel
+    I2pAddress { keys: PathBuf },
     /// Add a board
     AddBoard {
         name: String,
@@ -312,6 +314,13 @@ async fn main() -> anyhow::Result<()> {
             let key = PublicKey::from_hex(&key)?;
             moderate::end_moderator(&cli.data, root_key.as_deref(), key)?;
             println!("Ended {}'s appointment", key.fingerprint());
+        }
+        Command::I2pAddress { keys } => {
+            let bytes = anyhow::Context::with_context(std::fs::read(&keys), || format!("can't read {}", keys.display()))?;
+            if bytes.len() < 387 {
+                anyhow::bail!("{} isn't an i2pd keys file", keys.display());
+            }
+            println!("{}", anathemic_core::i2p::b32_address(&anathemic_core::i2p::destination_hash(&bytes)));
         }
         Command::Moderators => {
             let list = moderate::moderators(&cli.data)?;

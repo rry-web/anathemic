@@ -51,6 +51,21 @@ stays on. A Raspberry Pi is plenty.
    The link names the site's root key, its identity. Get it from someone you trust, or check
    the key's fingerprint with the operator: everything the node accepts is checked against it.
 
+## The quick way
+
+In a copy of this repository, with Rust and i2pd installed (step 1 without the config, and
+step 2's Rust), one script builds the node, runs a private i2pd router for it with SAM on, and
+starts mirroring:
+
+```sh
+scripts/start-mirror.sh 'anathemic:forum.i2p?root=…&mirror=…'
+scripts/start-mirror.sh          # later runs remember the site
+```
+
+It keeps everything in `./mirror-data`. `--router` uses a router you already run instead, and
+`--help` lists the rest. The rest of this guide sets the same thing up by hand, which suits a
+machine that stays on.
+
 ## Running it
 
 ```sh

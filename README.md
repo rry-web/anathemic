@@ -41,6 +41,31 @@ Not yet: the seeding quota, media, tags, a full client UI.
 
 ## Trying it
 
+### The quick way: start scripts
+
+With [Rust](https://rustup.rs) and i2pd installed (`brew install i2pd`, or
+`sudo apt install i2pd`), two scripts do everything over real I2P. Each runs its own private
+i2pd router in its data folder, on its own ports, so it doesn't touch any other router on the
+computer (rynx's included).
+
+```sh
+# A site: creates it on the first run, publishes it over I2P, and prints its address and
+# share link. --quick seals epochs after 5 posts, so mirrors have something to fetch soon.
+scripts/start-site.sh --name "My Site" --board general:General --web-posting --quick
+
+# A mirror, on this computer or another, from the share link the site script printed
+scripts/start-mirror.sh 'anathemic:….b32.i2p?root=…'
+```
+
+Run either again with no arguments to start it from where it left off: the site lives in
+`./site-data` and the mirror in `./mirror-data` (`--data` to change). On its first run the site
+script also gives you a member key that's a moderator, and prints the commands to post and
+moderate with it. A new router takes a few minutes to join I2P; the site script says when its
+address starts answering. `--help` shows each script's options, such as `--port-base` for a
+second mirror on the same computer, or `start-mirror.sh --router` to use a router you already run.
+
+### By hand
+
 ```sh
 cargo build --release
 
