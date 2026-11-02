@@ -1,0 +1,19 @@
+[package]
+name = "anathemic-server"
+description = "The operator's server for an Anathemic swarmboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anathemic-core.workspace = true
+anyhow.workspace = true
+axum = "0.8"
+clap.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+[dev-dependencies]
+anathemic-client.workspace = true
+tempfile = "3"

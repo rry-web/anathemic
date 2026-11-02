@@ -1,0 +1,12 @@
+[package]
+name = "anathemic-client"
+description = "Command-line client for Anathemic swarmboards"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anathemic-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ureq = "2"
