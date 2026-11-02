@@ -174,9 +174,15 @@ a candidate way to publish the manifest when the server is offline.
 
 A sealed epoch is a deterministic archive, so every honest sealer produces identical bytes:
 
-- post records in CBOR, sorted by post number;
+- post records in CBOR, sorted by post number, and a tombstone (number and hash) for each post
+  purged;
 - on boards of tier 1 or higher, the thumbnails of the epoch's media;
 - compressed with zstd at a fixed level.
+
+Each epoch has an **index**: the hash of its board, number, predecessor and each post's hash.
+The next epoch chains to the index, not to the bundle's hash, so purging a post (swapping it
+for its tombstone) remakes the bundle and its torrent without breaking the chain. The manifest
+lists both.
 
 Media are not stored in the bundle. Posts refer to them as
 `{sha256, size, mime, tier, infohash?}`. Every file's SHA-256 is listed whether or not BitTorrent
@@ -291,6 +297,25 @@ whatever an operator removes is removed from that site's mirrors too.
   A banned key's later posts are refused, and its earlier ones can be hidden in bulk.
 - **Shared hash blocklists:** a site can subscribe to blocklists other operators sign, and
   combine them with its own.
+
+As built (phase 3): a moderator certificate is `{key, name, boards, powers, issued, expires}`,
+signed by the root key and listed in the manifest; a later certificate for the same key ends
+the earlier one from its issue time, so appointments end without undoing past decisions. The
+powers are hide, purge and ban; *restore* undoes a hide or a ban. A moderator signs a
+`Revocation {target, action, reason, time}`; the writer checks it against the certificates,
+numbers it, stamps the time and countersigns it as a `Logged` entry. Each entry's hash folds
+into the next, and the manifest carries the count and the folded hash. Clients replay the whole
+log to learn what's hidden, purged and banned, honouring it on their own pages and in what they
+mirror. Bans are enforced by the writer, on member keys; anonymous web posts have none.
+
+The log is the site's public record of moderation. The server and every mirror render it at
+`/moderation` (appointments, then each entry with its moderator's name, action, target and
+reason), and `anathemic-client log` prints it after replaying and checking it, so readers
+needn't trust whoever draws the page.
+
+Not yet: shared hash blocklists (they matter once there's media), hiding a banned member's
+earlier posts in bulk (it would show which hidden-author posts share an author), and a way to
+moderate from the web pages.
 
 ## Spam in the LLM era
 
@@ -488,6 +513,7 @@ mirrored epochs.
    the server is down; manifests relayed. The server runs the I2P tracker, and nodes use
    librqbit through a SAM bridge (chosen by the tests in `experiments/i2p-torrents`).
 3. **Moderation:** moderator certificates, the revocation list, bans, the moderation window.
+   Built: certificates, the log, hide, purge (re-sealing via the index), bans.
 4. **Tier 1 media:** the upload pipeline, I2P media torrents, the seeding quota and challenges.
 5. **Tier 2 media:** seedboxes, clearnet torrents, the delays and notices.
 6. **The dedicated client UI**, and read support in rynx.

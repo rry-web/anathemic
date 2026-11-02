@@ -17,6 +17,7 @@ use std::{
 use anathemic_core::{
     Authors, Content, Post, PublicKey, Signed, Time,
     link::Link,
+    moderation::{Entry, ModCert, Moderation, Target},
     now, utc, valid_board_name,
     markup::{self, Block, Inline},
 };
@@ -32,8 +33,9 @@ use serde::Deserialize;
 use crate::{BoardSummary, EpochState, Fail, Site, ThreadSummary, refuse};
 
 /// Board names the server's own addresses use
-pub const RESERVED: &[&str] = &["announce", "boards", "manifest", "mirrors", "static"];
+pub const RESERVED: &[&str] = &["announce", "boards", "hosts", "manifest", "mirrors", "moderation", "revocations", "static"];
 const THREADS_PER_PAGE: u64 = 50;
+const LOG_ENTRIES_PER_PAGE: u64 = 100;
 /// The header an i2pd HTTP server tunnel adds, naming the visitor's destination
 const DESTINATION_HEADER: &str = "x-i2p-desthash";
 
@@ -60,6 +62,8 @@ pub trait Source: Send + Sync + 'static {
     fn mirrors(&self) -> Vec<String> {
         Vec::new()
     }
+    /// What moderators have hidden and purged
+    fn moderation(&self) -> Result<Arc<Moderation>, Fail>;
     fn submit_web(&self, _board: &str, _content: Content, _from: Option<&str>, _now: u64) -> Result<Signed<Post>, Fail> {
         refuse("this is a read-only mirror; post on the site itself")
     }
@@ -96,11 +100,15 @@ impl Source for Site {
     fn mirrors(&self) -> Vec<String> {
         self.tracker.mirrors(now(), 3).iter().map(anathemic_core::i2p::b32_address).collect()
     }
+    fn moderation(&self) -> Result<Arc<Moderation>, Fail> {
+        Site::moderation(self)
+    }
 }
 
 pub fn routes<S: Source>() -> Router<Arc<S>> {
     Router::new()
         .route("/", get(index::<S>))
+        .route("/moderation", get(moderation_log::<S>))
         .route("/{board}", get(to_board))
         .route("/{board}/", get(board::<S>).post(new_thread::<S>))
         .route("/{board}/{thread}", get(thread::<S>).post(new_reply::<S>))
@@ -175,7 +183,7 @@ fn page(site: &impl Source, about: &About, title: &str, crumbs: &[(&str, &str)],
          <title>{title}</title><style>{STYLE}</style></head><body>\
          <nav>{nav}</nav>\n{banner}{body}\n<footer><p>An Anathemic swarmboard. Root key {fingerprint} \
          (<code>{root}</code>). {drawn}; the anathemic client checks every signature \
-         itself.</p>{share}</footer></body></html>\n",
+         itself. <a href=\"/moderation\">Moderation log</a>: every moderator action, and who took it.</p>{share}</footer></body></html>\n",
         fingerprint = site.root().fingerprint(),
         root = site.root().to_hex(),
         share = share(site, about),
@@ -244,6 +252,119 @@ async fn index<S: Source>(State(site): State<Arc<S>>) -> Result<Response, Fail> 
     Ok(page(&*site, &about, &about.title, &[], &body))
 }
 
+/// The public record of moderation: who may moderate, and every entry of the log, newest first
+async fn moderation_log<S: Source>(State(site): State<Arc<S>>, Query(query): Query<PageQuery>) -> Result<Response, Fail> {
+    let about = about(&*site)?;
+    let moderation = site.moderation()?;
+    let at = now();
+    let mut body = String::from(
+        "<h1>Moderation log</h1>\n<p>Every action a moderator takes is signed by them, countersigned by the site, \
+         and chained into this log, which every mirror keeps a copy of. Nothing can be taken out of it or \
+         changed without readers&#39; clients noticing. Purged posts&#39; text is gone; the entry stays.</p>\n",
+    );
+
+    let appointments = moderation.appointments(at);
+    let (current, former): (Vec<&ModCert>, Vec<&ModCert>) = appointments.into_iter().partition(|cert| cert.in_force(at));
+    body.push_str("<h2 id=\"moderators\">Moderators</h2>\n");
+    if current.is_empty() {
+        body.push_str("<p>None appointed.</p>\n");
+    } else {
+        body.push_str(&appointment_table(&current, "Until"));
+    }
+    if !former.is_empty() {
+        body.push_str("<h3>Former moderators</h3>\n");
+        body.push_str(&appointment_table(&former, "Ended"));
+    }
+
+    let total = moderation.log.len() as u64;
+    let pages = total.div_ceil(LOG_ENTRIES_PER_PAGE).max(1);
+    let number = query.page.unwrap_or(1).max(1);
+    if number > pages {
+        return Err(Fail::NotFound);
+    }
+    let _ = writeln!(body, "<h2 id=\"log\">Actions</h2>\n<p class=\"meta\">{}, newest first.</p>", plural(total, "entry", "entries"));
+    if total > 0 {
+        body.push_str("<table><tr><th>#</th><th>Logged</th><th>Moderator</th><th>Action</th><th>Reason</th></tr>\n");
+        let entries = moderation.log.iter().rev().skip(((number - 1) * LOG_ENTRIES_PER_PAGE) as usize).take(LOG_ENTRIES_PER_PAGE as usize);
+        for entry in entries {
+            let reason = entry.revocation.reason.trim();
+            let _ = writeln!(
+                body,
+                "<tr id=\"r{n}\"><td>{n}</td><td>{}</td><td>{}</td><td>{} {}</td><td>{}</td></tr>",
+                utc(entry.accepted),
+                moderator(&moderation, entry),
+                escape(&entry.verb()),
+                target(&moderation, &entry.revocation.target),
+                if reason.is_empty() { "<em>none given</em>".to_string() } else { escape(reason) },
+                n = entry.number,
+            );
+        }
+        body.push_str("</table>\n");
+    }
+    if pages > 1 {
+        let mut links = Vec::new();
+        if number > 1 {
+            links.push(format!("<a href=\"/moderation?page={}#log\">Newer</a>", number - 1));
+        }
+        links.push(format!("Page {number} of {pages}"));
+        if number < pages {
+            links.push(format!("<a href=\"/moderation?page={}#log\">Older</a>", number + 1));
+        }
+        let _ = writeln!(body, "<nav class=\"pagination\">{}</nav>", links.join(" · "));
+    }
+    body.push_str(
+        "<p class=\"meta\">To check the log yourself rather than trust whoever drew this page: \
+         <code>anathemic-client log &lt;this site&#39;s address&gt;</code></p>\n",
+    );
+    Ok(page(&*site, &about, "Moderation log", &[("/moderation", "Moderation log")], &body))
+}
+
+fn appointment_table(certs: &[&ModCert], until: &str) -> String {
+    let mut out = format!("<table><tr><th>Name</th><th>Key</th><th>Boards</th><th>Powers</th><th>Appointed</th><th>{until}</th></tr>\n");
+    for cert in certs {
+        let boards = if cert.boards.is_empty() {
+            "all".to_string()
+        } else {
+            cert.boards.iter().map(|b| format!("<a href=\"/{b}/\">/{b}/</a>", b = escape(b))).collect::<Vec<_>>().join(" ")
+        };
+        let _ = writeln!(
+            out,
+            "<tr><td>{}</td><td><code>{}</code></td><td>{boards}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape(&cert.name),
+            cert.key.fingerprint(),
+            cert.powers.iter().map(|p| p.name()).collect::<Vec<_>>().join(", "),
+            utc(cert.issued),
+            cert.expires.map_or_else(|| "—".to_string(), utc),
+        );
+    }
+    out.push_str("</table>\n");
+    out
+}
+
+fn moderator(moderation: &Moderation, entry: &Entry) -> String {
+    let key = format!("<code>{}</code>", entry.moderator.fingerprint());
+    match moderation.moderator_name(&entry.moderator, entry.accepted) {
+        Some(name) => format!("{} {key}", escape(name)),
+        None => key,
+    }
+}
+
+fn target(moderation: &Moderation, target: &Target) -> String {
+    match target {
+        // A purged post is gone, so there's nothing to link to
+        Target::Post { board, number } if moderation.is_purged(board, *number) => {
+            format!("post #{number} on <a href=\"/{board}/\">/{board}/</a>", board = escape(board))
+        }
+        Target::Post { board, number } => {
+            format!("<a href=\"/{board}/post/{number}\">post #{number}</a> on <a href=\"/{board}/\">/{board}/</a>", board = escape(board))
+        }
+        Target::Member { key, board: Some(board) } => {
+            format!("member <code>{}</code> on <a href=\"/{board}/\">/{board}/</a>", key.fingerprint(), board = escape(board))
+        }
+        Target::Member { key, board: None } => format!("member <code>{}</code> across the site", key.fingerprint()),
+    }
+}
+
 #[derive(Deserialize)]
 struct PageQuery {
     page: Option<u64>,
@@ -267,6 +388,7 @@ fn board_page(site: &impl Source, name: &str, number: u64, refused: Option<&str>
     let (title, authors, web) = site.board(name)?;
     let number = number.max(1);
     let (threads, total) = site.threads(name, (number - 1) * THREADS_PER_PAGE, THREADS_PER_PAGE)?;
+    let moderation = site.moderation()?;
     let pages = total.div_ceil(THREADS_PER_PAGE).max(1);
     if number > pages {
         return Err(Fail::NotFound);
@@ -289,7 +411,10 @@ fn board_page(site: &impl Source, name: &str, number: u64, refused: Option<&str>
                 thread.replies,
                 utc(thread.last),
                 number = thread.start.number,
-                title = escape(thread.start.content.title.as_deref().unwrap_or("")),
+                title = match moderation.removed(name, thread.start.number) {
+                    Some(_) => "[hidden by a moderator]".to_string(),
+                    None => escape(thread.start.content.title.as_deref().unwrap_or("")),
+                },
             );
         }
         body.push_str("</table>\n");
@@ -365,7 +490,11 @@ fn thread_page(site: &impl Source, name: &str, number: u64, refused: Option<&str
         result => result?,
     };
     let states = site.epoch_states(name)?;
-    let title = posts[0].content.title.clone().unwrap_or_default();
+    let moderation = site.moderation()?;
+    let title = match moderation.removed(name, posts[0].number) {
+        Some(_) => "[hidden by a moderator]".to_string(),
+        None => posts[0].content.title.clone().unwrap_or_default(),
+    };
     let here: HashSet<u64> = posts.iter().map(|post| post.number).collect();
 
     let mut body = format!("<h1>{}</h1>\n", escape(&title));
@@ -385,7 +514,10 @@ fn thread_page(site: &impl Source, name: &str, number: u64, refused: Option<&str
             "<div class=\"post\" id=\"p{n}\"><div class=\"meta\"><a href=\"#p{n}\">#{n}</a> · {author} · {} · epoch {} ({state})</div>\n{}</div>",
             utc(post.accepted),
             post.epoch,
-            render(post, name, &|n| here.contains(&n)),
+            match moderation.removed(name, post.number) {
+                Some(reason) => format!("<p class=\"meta\"><em>Hidden by a moderator: {}</em></p>", escape(reason)),
+                None => render(post, name, &|n| here.contains(&n)),
+            },
             n = post.number,
         );
     }

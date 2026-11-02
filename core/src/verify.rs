@@ -10,6 +10,8 @@ pub struct Verified {
     pub keys: Vec<PublicKey>,
     /// The sequence of the host list it carries, 0 if none
     pub hosts_sequence: u64,
+    /// The moderators the root key appointed, each until the next certificate for its key
+    pub moderators: Vec<crate::moderation::ModCert>,
 }
 
 /// Checks the root key's certificate for the site key, then the site key's signature.
@@ -40,6 +42,7 @@ pub fn manifest(signed: &Signed<Manifest>, pinned: Option<&PublicKey>) -> Result
         return Err(Error::WrongSigner);
     }
     let manifest = signed.open(Context::Manifest, None)?;
+    let moderators = crate::moderation::open_certs(&manifest.moderators, &manifest.root)?;
     check_site_text(&manifest.name, &manifest.description)?;
     if let Some(address) = manifest.addresses.iter().find(|a| !valid_address(a)) {
         return Err(invalid(format!("{address:?} isn't an I2P address")));
@@ -55,7 +58,7 @@ pub fn manifest(signed: &Signed<Manifest>, pinned: Option<&PublicKey>) -> Result
             return Err(invalid(format!("board {}'s epochs have gaps", board.name)));
         }
     }
-    Ok(Verified { manifest, site_key: signed.signer, keys, hosts_sequence })
+    Ok(Verified { manifest, site_key: signed.signer, keys, hosts_sequence, moderators })
 }
 
 #[cfg(test)]
@@ -77,6 +80,8 @@ mod tests {
             boards: vec![],
             term: 0,
             hosts: None,
+            moderators: vec![],
+            revocations: Default::default(),
         };
         site.sign(Context::Manifest, &manifest)
     }

@@ -239,6 +239,29 @@ impl Node {
         let (client, root) = (self.client.clone(), self.root);
         let _ = tokio::task::spawn_blocking(move || client.refresh_mirrors(&root, true)).await;
         let peers = self.mirror_peers().await;
+        // The revocation log, for the mirror's pages and for clients that read from here
+        let (client, verified) = (self.client.clone(), site.clone());
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || client.moderation(&verified)).await {
+            println!("Couldn't read the revocation log: {e:#}");
+        }
+        // A purge re-seals an epoch as a new torrent; stop sharing the old one, bytes and all
+        let current: std::collections::HashSet<Hash20> =
+            site.manifest.boards.iter().flat_map(|board| board.sealed.iter().filter_map(|sealed| sealed.infohash)).collect();
+        let stale: Vec<(Hash20, String, ManagedTorrentHandle)> = self
+            .held
+            .lock()
+            .await
+            .iter()
+            .filter(|(hash, _)| !current.contains(hash))
+            .map(|(hash, (name, handle))| (*hash, name.clone(), handle.clone()))
+            .collect();
+        for (hash, name, handle) in stale {
+            if let Err(e) = self.rq.delete(TorrentIdOrHash::Id(handle.id()), true).await {
+                println!("{name}: couldn't stop sharing the old copy: {e:#}");
+            }
+            self.held.lock().await.remove(&hash);
+            println!("{name}: re-sealed by the site, so dropped the old copy");
+        }
         for board in &site.manifest.boards {
             if !self.cli.boards.is_empty() && !self.cli.boards.contains(&board.name) {
                 continue;

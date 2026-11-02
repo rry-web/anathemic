@@ -11,6 +11,7 @@ pub mod keys;
 pub mod link;
 pub mod markup;
 pub mod model;
+pub mod moderation;
 pub mod torrent;
 pub mod verify;
 

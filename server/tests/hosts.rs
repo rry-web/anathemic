@@ -3,12 +3,19 @@
 
 use std::sync::Arc;
 
-use anathemic_client::Client;
-use anathemic_core::{Authors, Content, SecretKey, link::Link, now};
+use anathemic_client::{Client, member_key};
+use anathemic_core::{
+    Authors, Content, SecretKey,
+    link::Link,
+    moderation::{Action, Power, Revocation, Target},
+    now,
+};
 use anathemic_server::{
     Config, Site, add_board,
     hosts::{Role, add_host, init_standby, orphans, set_host_address},
-    init, router, set_web_posting,
+    init,
+    moderate::add_moderator,
+    router, set_web_posting,
 };
 
 fn serve_on(site: Arc<Site>, listener: std::net::TcpListener) -> tokio::runtime::Runtime {
@@ -64,15 +71,27 @@ fn a_trusted_host_takes_over_and_the_old_writer_steps_down() {
     assert_eq!(standby.role().unwrap(), Role::Standby);
     assert_eq!(bodies(&standby), ["first", "second", "third", "fourth"]);
 
+    // Moderation is copied too: a hide, and a purge that re-seals epoch 0
+    let moderator_home = dir.path().join("moderator");
+    let (moderator_key, _) = member_key(&moderator_home, &root).unwrap();
+    add_moderator(&primary_dir, None, moderator_key.public(), "mod", vec![], vec![Power::Hide, Power::Purge], None).unwrap();
+    let moderator = Client::new(&format!("http://{primary_address}"), None, moderator_home).unwrap();
+    let act = |number, action| Revocation { target: Target::Post { board: "general".into(), number }, action, reason: "spam".into(), time: now() };
+    moderator.moderate(&moderator_key, act(2, Action::Hide)).unwrap();
+    moderator.moderate(&moderator_key, act(3, Action::Purge)).unwrap();
+    standby.host_tick(now()).unwrap();
+    assert_eq!(standby.moderation().unwrap().removed("general", 2), Some("spam"));
+    assert_eq!(bodies(&standby), ["first", "second", "fourth"]);
+
     // Readers at the standby get the writer's manifest, and their posts reach the writer
     let reader_link = Link { address: standby_address.clone(), root, mirrors: vec![] };
     let reader = Client::new(&reader_link.to_string(), None, dir.path().join("reader")).unwrap();
     let site = reader.manifest().unwrap();
-    assert_eq!((site.manifest.term, reader.board_posts(&site, "general").unwrap().len()), (0, 4));
+    assert_eq!((site.manifest.term, reader.board_posts(&site, "general").unwrap().len()), (0, 3));
     assert_eq!(reader.submit(&key, "general", reply(1, "sent to the standby"), false).unwrap().number, 5);
     let page = ureq::post(&format!("http://{standby_address}/general/1")).send_form(&[("body", "from a browser at the standby")]);
     assert!(page.unwrap().into_string().unwrap().contains("from a browser at the standby"));
-    assert_eq!(bodies(&primary).len(), 6);
+    assert_eq!(bodies(&primary).len(), 5);
 
     // The operator's server goes down. The standby waits, then takes over in term 1.
     drop(primary_runtime);
@@ -84,7 +103,7 @@ fn a_trusted_host_takes_over_and_the_old_writer_steps_down() {
     assert_eq!(site.manifest.term, 1);
     assert_eq!(site.site_key, standby_key);
     assert_eq!(reader.submit(&key, "general", reply(1, "after the takeover"), false).unwrap().number, 7);
-    assert_eq!(reader.board_posts(&reader.manifest().unwrap(), "general").unwrap().len(), 7);
+    assert_eq!(reader.board_posts(&reader.manifest().unwrap(), "general").unwrap().len(), 6);
 
     // A member who only knows the operator's address finds the standby on the host list, and
     // posts there

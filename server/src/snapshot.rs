@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anathemic_core::{Authors, Post, PublicKey, Time};
+use anathemic_core::{Authors, Post, PublicKey, Time, moderation::Moderation};
 
 use crate::{BoardSummary, EpochState, Fail, ThreadSummary, web::Source};
 
@@ -20,6 +20,7 @@ pub struct Snapshot {
     pub boards: Vec<SnapshotBoard>,
     /// Mirrors' addresses for the share link, this one first
     pub mirrors: Vec<String>,
+    pub moderation: Arc<Moderation>,
 }
 
 pub struct SnapshotBoard {
@@ -146,5 +147,9 @@ impl Source for Mirrored {
 
     fn mirrors(&self) -> Vec<String> {
         self.current().mirrors.clone()
+    }
+
+    fn moderation(&self) -> Result<Arc<Moderation>, Fail> {
+        Ok(self.current().moderation.clone())
     }
 }

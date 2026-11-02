@@ -11,7 +11,7 @@ use std::{
 };
 
 use anathemic_core::{
-    Authors, BoardEntry, Content, Context, Epoch, FORMAT, Hash20, Hash32, Manifest, Post, PublicKey, SealedRef,
+    Authors, BoardEntry, Content, Context, EPOCH_FORMAT, Epoch, FORMAT, Hash20, Hash32, Manifest, Post, PublicKey, SealedRef,
     SecretKey, Signed, SiteCert, Submission, Time, cbor, check_site_text, epoch, now, torrent, valid_address,
     valid_board_name,
 };
@@ -28,6 +28,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 pub mod hosts;
+pub mod moderate;
 pub mod snapshot;
 pub mod tracker;
 pub mod web;
@@ -112,10 +113,19 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
     if has_web == 0 {
         db.execute_batch("alter table boards add column web integer not null default 0;")?;
     }
-    let has_infohash: i64 =
-        db.query_row("select count(*) from pragma_table_info('epochs') where name = 'infohash'", [], |r| r.get(0))?;
-    if has_infohash == 0 {
+    let column = |table: &str, name: &str| -> rusqlite::Result<bool> {
+        let count: i64 = db.query_row(&format!("select count(*) from pragma_table_info('{table}') where name = ?1"), [name], |r| r.get(0))?;
+        Ok(count > 0)
+    };
+    if !column("epochs", "infohash")? {
         db.execute_batch("alter table epochs add column infohash blob;")?;
+    }
+    // Moderation: an epoch's index, and a purged post's hash once its record is emptied
+    if !column("epochs", "idx")? {
+        db.execute_batch("alter table epochs add column idx blob;")?;
+    }
+    if !column("posts", "purged")? {
+        db.execute_batch("alter table posts add column purged blob;")?;
     }
     db.execute_batch(
         "insert or ignore into meta values('name', '');
@@ -128,6 +138,8 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
          insert or ignore into meta values('relayed', x'');
          insert or ignore into meta values('promote', 0);
          insert or ignore into meta values('follow', '');
+         insert or ignore into meta values('moderators', x'');
+         create table if not exists revocations(number integer primary key, entry blob not null);
          create table if not exists orphans(board text not null, number integer not null, record blob not null,
                                             author blob not null, submission blob not null, orphaned integer not null);
          create index if not exists posts_by_thread on posts(board, thread, number);
@@ -273,6 +285,8 @@ fn refuse<T>(message: &str) -> Result<T, Fail> {
     Err(Fail::Refused(message.to_string()))
 }
 
+type ModerationCache = ((u64, usize), Arc<anathemic_core::moderation::Moderation>);
+
 pub struct Site {
     db: Mutex<Connection>,
     key: SecretKey,
@@ -280,6 +294,9 @@ pub struct Site {
     config: Config,
     /// When a standby last copied the writer
     last_contact: Mutex<Time>,
+    /// The revocation log added up, and how many entries that was
+    /// What the log adds up to, by the log's length and the number of appointments
+    moderation: Mutex<Option<ModerationCache>>,
     /// When recent web posts were made, by board and by board and destination
     web_posts: Mutex<HashMap<String, Vec<Time>>>,
     /// Who holds which sealed epochs
@@ -314,6 +331,7 @@ impl Site {
             root,
             config,
             last_contact: Mutex::new(now()),
+            moderation: Mutex::new(None),
             web_posts: Mutex::new(HashMap::new()),
             tracker: Default::default(),
         })
@@ -340,7 +358,7 @@ impl Site {
             let mut sealed = Vec::new();
             let mut unsealed = Vec::new();
             let mut epochs = db.prepare(
-                "select number, state, sha256, length(bundle), infohash from epochs where board = ?1 order by number",
+                "select number, state, sha256, length(bundle), infohash, idx from epochs where board = ?1 order by number",
             )?;
             let mut rows = epochs.query([&name])?;
             while let Some(r) = rows.next()? {
@@ -350,7 +368,9 @@ impl Site {
                     let sha256 = Hash32(sha256.try_into().map_err(|_| Fail::Internal("bad epoch hash".into()))?);
                     let infohash: Option<Vec<u8>> = r.get(4)?;
                     let infohash = infohash.and_then(|hash| hash.try_into().ok()).map(Hash20);
-                    sealed.push(SealedRef { epoch: number as u64, sha256, size: r.get::<_, i64>(3)? as u64, infohash });
+                    let index: Option<Vec<u8>> = r.get(5)?;
+                    let index = index.and_then(|hash| hash.try_into().ok()).map(Hash32);
+                    sealed.push(SealedRef { epoch: number as u64, sha256, size: r.get::<_, i64>(3)? as u64, infohash, index });
                 } else {
                     unsealed.push(number as u64);
                 }
@@ -368,6 +388,8 @@ impl Site {
             site_cert: hosts::load_cert(&db)?,
             term: term as u64,
             hosts: hosts::load_hosts(&db)?,
+            moderators: moderate::load_moderators(&db)?,
+            revocations: moderate::log_head(&db)?,
             sequence: sequence as u64,
             published: now,
             name: text("name")?,
@@ -440,6 +462,11 @@ impl Site {
             (Some(Authors::Choice), anonymous) => !anonymous,
             _ => false,
         };
+        drop(db);
+        if self.moderation()?.banned(&signed.signer, board, now) {
+            return refuse("you're banned from posting here");
+        }
+        let db = self.db();
         check_thread(&db, board, &submission.content)?;
         let fingerprint = Sha256::digest(&signed.body).to_vec();
         let seen: i64 = db.query_row("select count(*) from posts where submission = ?1", [&fingerprint], |r| r.get(0))?;
@@ -514,7 +541,7 @@ impl Site {
         };
         let record = self.key.sign(Context::Post, &post);
         db.execute(
-            "insert into posts values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "insert into posts(board, number, epoch, thread, record, author, submission) values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![board, number, epoch, post.content.thread.map(|t| t as i64), cbor::to_vec(&record), author_key, fingerprint],
         )?;
         let count: i64 = db.query_row(
@@ -596,8 +623,8 @@ impl Site {
         let rows: Vec<(String, String, String, i64, i64)> = db
             .prepare(
                 "select name, title, authors,
-                        (select count(*) from posts where board = name and thread is null),
-                        (select count(*) from posts where board = name)
+                        (select count(*) from posts where board = name and thread is null and record != x''),
+                        (select count(*) from posts where board = name and record != x'')
                  from boards order by position",
             )?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
@@ -636,13 +663,13 @@ impl Site {
         self.board(board)?;
         let db = self.db();
         let total: i64 =
-            db.query_row("select count(*) from posts where board = ?1 and thread is null", [board], |r| r.get(0))?;
+            db.query_row("select count(*) from posts where board = ?1 and thread is null and record != x''", [board], |r| r.get(0))?;
         // Post numbers rise with time, so the highest number is the newest post
         let rows: Vec<(Vec<u8>, i64, i64)> = db
             .prepare(
                 "select s.record, count(r.number), coalesce(max(r.number), s.number) as last
-                 from posts s left join posts r on r.board = s.board and r.thread = s.number
-                 where s.board = ?1 and s.thread is null
+                 from posts s left join posts r on r.board = s.board and r.thread = s.number and r.record != x''
+                 where s.board = ?1 and s.thread is null and s.record != x''
                  group by s.number order by last desc limit ?2 offset ?3",
             )?
             .query_map(params![board, take as i64, skip as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -666,7 +693,7 @@ impl Site {
         let records: Vec<Vec<u8>> = db
             .prepare(
                 "select record from posts where board = ?1 and (number = ?2 and thread is null or thread = ?2)
-                 order by number",
+                 and record != x'' order by number",
             )?
             .query_map(params![board, number as i64], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
@@ -714,7 +741,7 @@ impl Site {
 fn check_thread(db: &Connection, board: &str, content: &Content) -> Result<(), Fail> {
     if let Some(thread) = content.thread {
         let starts: i64 = db.query_row(
-            "select count(*) from posts where board = ?1 and number = ?2 and thread is null",
+            "select count(*) from posts where board = ?1 and number = ?2 and thread is null and record != x''",
             params![board, thread as i64],
             |r| r.get(0),
         )?;
@@ -738,7 +765,7 @@ fn decode(record: &[u8]) -> Result<Post, Fail> {
 fn latest(db: &Connection, board: &str, number: Option<u64>) -> Result<Option<Post>, Fail> {
     let record: Option<Vec<u8>> = db
         .query_row(
-            "select record from posts where board = ?1 and (?2 is null or number = ?2) order by number desc limit 1",
+            "select record from posts where board = ?1 and (?2 is null or number = ?2) and record != x'' order by number desc limit 1",
             params![board, number.map(|n| n as i64)],
             |r| r.get(0),
         )
@@ -748,7 +775,7 @@ fn latest(db: &Connection, board: &str, number: Option<u64>) -> Result<Option<Po
 
 fn load_posts(db: &Connection, board: &str, epoch: u64) -> Result<Vec<Signed<Post>>, Fail> {
     let records: Vec<Vec<u8>> = db
-        .prepare("select record from posts where board = ?1 and epoch = ?2 order by number")?
+        .prepare("select record from posts where board = ?1 and epoch = ?2 and record != x'' order by number")?
         .query_map(params![board, epoch as i64], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     records
@@ -778,24 +805,27 @@ fn seal_epoch(db: &Connection, board: &str, number: i64) -> Result<(), Fail> {
     let prev = if number == 0 {
         None
     } else {
-        let hash: Option<Vec<u8>> = db
+        // The previous epoch's index, or its hash if it was sealed before indexes
+        let link: Option<Vec<u8>> = db
             .query_row(
-                "select sha256 from epochs where board = ?1 and number = ?2 and state = 'sealed'",
+                "select coalesce(idx, sha256) from epochs where board = ?1 and number = ?2 and state = 'sealed'",
                 params![board, number - 1],
                 |r| r.get(0),
             )
             .optional()?;
         // Epochs seal in order; the previous one goes first
-        let Some(hash) = hash else { return Ok(()) };
-        Some(Hash32(hash.try_into().map_err(|_| Fail::Internal("bad epoch hash".into()))?))
+        let Some(link) = link else { return Ok(()) };
+        Some(Hash32(link.try_into().map_err(|_| Fail::Internal("bad epoch hash".into()))?))
     };
     let posts = load_posts(db, board, number as u64)?;
-    let epoch = Epoch { format: FORMAT, board: board.to_string(), number: number as u64, prev, posts };
+    let purged = moderate::tombstones(db, board, number)?;
+    let epoch = Epoch { format: EPOCH_FORMAT, board: board.to_string(), number: number as u64, prev, posts, purged };
+    let index = epoch::index(&epoch);
     let (bundle, hash) = epoch::seal(&epoch);
     let infohash = torrent::bundle_hash(&bundle, board, number as u64);
     db.execute(
-        "update epochs set state = 'sealed', sha256 = ?3, bundle = ?4, infohash = ?5 where board = ?1 and number = ?2",
-        params![board, number, hash.0.to_vec(), bundle, infohash.0.to_vec()],
+        "update epochs set state = 'sealed', sha256 = ?3, bundle = ?4, infohash = ?5, idx = ?6 where board = ?1 and number = ?2",
+        params![board, number, hash.0.to_vec(), bundle, infohash.0.to_vec(), index.0.to_vec()],
     )?;
     bump(db)?;
     Ok(())
@@ -851,6 +881,7 @@ pub fn router(site: Arc<Site>) -> Router {
         .route("/hosts/state", get(hosts::get_state))
         .route("/hosts/posts", get(hosts::get_posts))
         .route("/hosts/web", post(hosts::post_web))
+        .route("/revocations", get(moderate::get_revocations).post(moderate::post_revocation))
         .route("/boards/{board}/posts", post(post_submission))
         .merge(web::routes())
         .with_state(site)

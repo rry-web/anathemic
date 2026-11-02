@@ -12,8 +12,8 @@ use std::{
     sync::Arc,
 };
 
-use anathemic_client::{MANIFEST_FILE, read_cache};
-use anathemic_core::{Manifest, PublicKey, Signed, cbor, torrent, valid_board_name};
+use anathemic_client::{LOG_FILE, MANIFEST_FILE, read_cache};
+use anathemic_core::{Manifest, PublicKey, Signed, cbor, moderation::Logged, torrent, valid_board_name};
 use anathemic_server::{
     EpochState,
     snapshot::{Mirrored, Snapshot, SnapshotBoard},
@@ -21,7 +21,7 @@ use anathemic_server::{
 };
 use axum::{
     Router,
-    extract::{Path as UrlPath, State},
+    extract::{Path as UrlPath, RawQuery, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -39,6 +39,7 @@ pub async fn serve(folder: PathBuf, pages: Arc<Mirrored>) -> anyhow::Result<Sock
 pub fn router(folder: PathBuf, pages: Arc<Mirrored>) -> Router {
     Router::new()
         .route("/manifest", get(manifest))
+        .route("/revocations", get(revocations))
         .route("/boards/{board}/epochs/{number}", get(bundle))
         .route("/boards/{board}/epochs/{number}/posts", get(posts))
         .route("/boards/{board}/epochs/{number}/torrent", get(torrent_file))
@@ -70,6 +71,7 @@ pub fn snapshot(home: &Path, root: &PublicKey, mirrors: Vec<String>) -> anyhow::
         published: manifest.published,
         boards,
         mirrors,
+        moderation: Arc::new(cached.moderation),
     })
 }
 
@@ -82,6 +84,18 @@ fn file(path: &Path, content_type: &'static str) -> Response {
 
 async fn manifest(State(folder): State<Arc<PathBuf>>) -> Response {
     file(&folder.join(MANIFEST_FILE), "application/cbor")
+}
+
+/// The revocation log from an entry on, as far as it's held
+async fn revocations(State(folder): State<Arc<PathBuf>>, RawQuery(query): RawQuery) -> Response {
+    let from: usize = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("from=")))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let log: Vec<Signed<Logged>> = std::fs::read(folder.join(LOG_FILE)).ok().and_then(|bytes| cbor::from_slice(&bytes).ok()).unwrap_or_default();
+    let page: Vec<&Signed<Logged>> = log.iter().skip(from).collect();
+    ([(header::CONTENT_TYPE, "application/cbor")], cbor::to_vec(&page)).into_response()
 }
 
 async fn bundle(State(folder): State<Arc<PathBuf>>, UrlPath((board, number)): UrlPath<(String, u64)>) -> Response {

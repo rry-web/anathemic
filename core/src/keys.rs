@@ -81,6 +81,12 @@ pub enum Context {
     Hosts,
     /// A request from one of a site's servers to another
     HostRequest,
+    /// The root key's appointment of a moderator
+    ModCert,
+    /// A moderator's decision
+    Revocation,
+    /// A revocation as the site's writer logged it
+    Logged,
 }
 
 impl Context {
@@ -92,6 +98,9 @@ impl Context {
             Context::Post => b"anathemic/1/post",
             Context::Hosts => b"anathemic/1/hosts",
             Context::HostRequest => b"anathemic/1/host-request",
+            Context::ModCert => b"anathemic/1/mod-cert",
+            Context::Revocation => b"anathemic/1/revocation",
+            Context::Logged => b"anathemic/1/logged",
         }
     }
 

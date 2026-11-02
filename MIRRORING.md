@@ -10,6 +10,8 @@ What a mirror does:
 - serves the site read-only at its own I2P address, as web pages (for rynx and other browsers)
   and as data for the anathemic client, which falls back on mirrors when the server is down;
 - takes the server's copy of an epoch only if no other mirror has it.
+- honours the site's moderation: it hides what moderators hid, deletes what they purged, and
+  serves the public moderation log at `/moderation`.
 
 It needs very little: a few MB of disk for a small site, a little bandwidth, and a computer that
 stays on. A Raspberry Pi is plenty.

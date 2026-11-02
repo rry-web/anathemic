@@ -33,7 +33,11 @@ the text core and mirroring:
   pass posts on to the operator's server, and take over posting by themselves if it goes
   offline.
 
-Not yet: the seeding quota, moderation, media, tags, a full client UI.
+- **Moderation:** moderators the root key appoints hide posts, purge them (their bytes deleted
+  everywhere, even from sealed epochs) and ban members, through a signed, append-only log that
+  the server, its hosts, mirrors and clients all honour.
+
+Not yet: the seeding quota, media, tags, a full client UI.
 
 ## Trying it
 
@@ -63,6 +67,52 @@ work while the server runs. Web posts are limited to 30 an hour per board, and 6
 destination (`serve --web-posts-per-hour`, `--web-posts-per-hour-each`).
 
 `init` writes `root.key`, the site's identity. `serve` never reads it, so keep a copy offline.
+
+### Moderation
+
+Appoint moderators by their member key for the site, which they see with
+`anathemic-client key <site>`. To moderate yourself, appoint your own key:
+
+```sh
+anathemic-server --data mysite add-moderator <their key> --name alice --power hide --power ban
+anathemic-server --data mysite add-moderator <key> --board general --power purge --days 90
+anathemic-server --data mysite moderators
+anathemic-server --data mysite end-moderator <key>      # what they did still counts
+```
+
+Moderators act with the client:
+
+```sh
+anathemic-client moderate <site> hide general 12 --reason "off topic"   # restore general 12 undoes it
+anathemic-client moderate <site> purge general 13 --reason "illegal"    # for good
+anathemic-client moderate <site> ban <member key> --board general --days 7 --reason spam
+anathemic-client moderate <site> unban <member key> --board general
+```
+
+- **Hide:** the post stays in its epoch, but the pages, mirrors and the client show the reason
+  instead. It can be restored.
+- **Purge:** deletes the post's bytes. During the moderation window (before its epoch seals)
+  it never reaches a sealed epoch. After sealing, the server re-seals the epoch without it: a
+  new bundle and torrent, with a tombstone holding the post's hash, so the board's chain still
+  checks out. Nodes drop the old copy. Epochs sealed before this version can only be hidden.
+- **Ban:** the member's posts are refused, on one board or the whole site, for some days or for
+  good. Web posts carry no key, so they're only rate limited.
+
+Every decision is signed by its moderator, then numbered and countersigned by the server into
+the revocation log (`/revocations`). The manifest names the log's length and chained hash, so a
+mirror can relay the log but not drop or change an entry.
+
+The log is public. Every page links to `/moderation`, which lists the moderators (current and
+former, with their boards and powers) and every action, newest first: when, which moderator,
+what they did to which post or member, and their reason. Mirrors serve the same page from their
+checked copy. To check it yourself rather than trust the page:
+
+```sh
+anathemic-client log <site>            # --last 20 for the newest only
+```
+
+Reasons are public, and a ban names the member's key, so on boards that hide authors, keep
+reasons from pointing at who wrote what.
 
 ### Over I2P
 

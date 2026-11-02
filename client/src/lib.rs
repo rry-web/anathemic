@@ -17,9 +17,10 @@ use std::{
 
 use anathemic_core::{
     Content, Context, Manifest, Post, PublicKey, SecretKey, Signed, Submission, cbor,
-    epoch::{check_epoch, check_order, check_post, open_bundle},
+    epoch::{check_epoch, check_order, check_post, link, open_bundle},
     i2p,
     link::{Link, MAX_LINK_MIRRORS},
+    moderation::{self, Logged, Moderation, Revocation},
     now, valid_board_name,
     verify::{self, Verified},
 };
@@ -28,6 +29,8 @@ use anyhow::{Context as _, anyhow, bail};
 const SITES: &str = "sites.txt";
 /// The signed manifest last read, in a site's cache folder
 pub const MANIFEST_FILE: &str = "manifest.cbor";
+/// The site's revocation log, as far as it's been read
+pub const LOG_FILE: &str = "revocations.cbor";
 /// A site's mirrors are asked for at most this often
 const MIRRORS_REFRESH: Duration = Duration::from_secs(60 * 60);
 const MAX_MIRRORS: usize = 50;
@@ -89,6 +92,8 @@ pub fn load_mirrors(home: &Path, root: &PublicKey) -> Vec<String> {
 pub struct Cached {
     pub site: Verified,
     pub boards: Vec<CachedBoard>,
+    /// From the log held, if it matches the manifest
+    pub moderation: Moderation,
 }
 
 pub struct CachedBoard {
@@ -103,6 +108,7 @@ pub struct CachedBoard {
 pub fn read_cache(home: &Path, root: &PublicKey) -> anyhow::Result<Cached> {
     let bytes = fs::read(cache_dir(home, root).join(MANIFEST_FILE)).context("no copy of this site's manifest is held")?;
     let site = verify::manifest(&cbor::from_slice(&bytes)?, Some(root))?;
+    let moderation = read_log(home, &site).unwrap_or_default();
     let mut boards = Vec::new();
     for board in &site.manifest.boards {
         let mut posts = Vec::new();
@@ -112,12 +118,12 @@ pub fn read_cache(home: &Path, root: &PublicKey) -> anyhow::Result<Cached> {
             let checked = fs::read(cache_path(home, root, &board.name, sealed.epoch))
                 .ok()
                 .and_then(|bundle| open_bundle(&bundle, sealed).ok())
-                .and_then(|epoch| check_epoch(&epoch, &board.name, sealed.epoch, prev, &site.keys).ok());
+                .and_then(|epoch| check_epoch(&epoch, &board.name, sealed.epoch, prev, sealed.index, &site.keys).ok());
             match checked {
                 Some(checked) => posts.extend(checked),
                 None => missing.push(sealed.epoch),
             }
-            prev = Some(sealed.sha256);
+            prev = Some(link(sealed));
         }
         for &number in &board.unsealed {
             let checked = fs::read(posts_path(home, root, &board.name, number))
@@ -133,9 +139,18 @@ pub fn read_cache(home: &Path, root: &PublicKey) -> anyhow::Result<Cached> {
         }
         posts.sort_by_key(|post| post.number);
         posts.dedup_by_key(|post| post.number);
+        // Posts purged since they were cached
+        posts.retain(|post| !moderation.is_purged(&board.name, post.number));
         boards.push(CachedBoard { name: board.name.clone(), posts, missing });
     }
-    Ok(Cached { site, boards })
+    Ok(Cached { site, boards, moderation })
+}
+
+/// The cached log, added up, if it's the whole log the manifest names
+fn read_log(home: &Path, site: &Verified) -> anyhow::Result<Moderation> {
+    let bytes = fs::read(cache_dir(home, &site.manifest.root).join(LOG_FILE))?;
+    let log: Vec<Signed<Logged>> = cbor::from_slice(&bytes)?;
+    Ok(moderation::replay(&log, &site.manifest.revocations, &site.keys, &site.moderators)?)
 }
 
 pub struct Client {
@@ -383,8 +398,8 @@ impl Client {
                 }
             };
             let epoch = open_bundle(&bundle, sealed)?;
-            posts.extend(check_epoch(&epoch, board, sealed.epoch, prev, &site.keys)?);
-            prev = Some(sealed.sha256);
+            posts.extend(check_epoch(&epoch, board, sealed.epoch, prev, sealed.index, &site.keys)?);
+            prev = Some(link(sealed));
         }
         posts.extend(self.unsealed_posts(site, board)?);
         check_order(&posts)?;
@@ -432,6 +447,60 @@ impl Client {
     /// The server's address, as given
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// What moderators have hidden, purged and banned: the site's revocation log, read on from
+    /// where the cached copy ends and checked against the manifest
+    pub fn moderation(&self, site: &Verified) -> anyhow::Result<Moderation> {
+        let path = cache_dir(&self.home, &site.manifest.root).join(LOG_FILE);
+        let mut log: Vec<Signed<Logged>> = fs::read(&path).ok().and_then(|bytes| cbor::from_slice(&bytes).ok()).unwrap_or_default();
+        let wanted = site.manifest.revocations.count;
+        // A longer copy than the manifest names came from an older log
+        if log.len() as u64 > wanted {
+            log.clear();
+        }
+        self.read_rest_of_log(&mut log, wanted)?;
+        let moderation = match moderation::replay(&log, &site.manifest.revocations, &site.keys, &site.moderators) {
+            Ok(moderation) => moderation,
+            Err(_) => {
+                // The cached part may be from an older log too; read the whole of it again
+                log.clear();
+                self.read_rest_of_log(&mut log, wanted)?;
+                moderation::replay(&log, &site.manifest.revocations, &site.keys, &site.moderators)?
+            }
+        };
+        fs::write(&path, cbor::to_vec(&log))?;
+        Ok(moderation)
+    }
+
+    fn read_rest_of_log(&self, log: &mut Vec<Signed<Logged>>, wanted: u64) -> anyhow::Result<()> {
+        while (log.len() as u64) < wanted {
+            let page: Vec<Signed<Logged>> = cbor::from_slice(&self.get(&format!("/revocations?from={}", log.len()))?)?;
+            if page.is_empty() {
+                bail!("the revocation log ends early");
+            }
+            log.extend(page);
+        }
+        log.truncate(wanted as usize);
+        Ok(())
+    }
+
+    /// Sends a moderator's decision, signed with their member key; returns it as logged
+    pub fn moderate(&self, key: &SecretKey, revocation: Revocation) -> anyhow::Result<Logged> {
+        let site = self.manifest()?;
+        let signed = key.sign(Context::Revocation, &revocation);
+        let base = self.source().unwrap_or_else(|| self.base.clone());
+        let response = self
+            .agent
+            .post(&format!("{base}/revocations"))
+            .set("Content-Type", "application/cbor")
+            .send_bytes(&cbor::to_vec(&signed))
+            .map_err(describe)?;
+        let logged: Signed<Logged> = cbor::from_slice(&read_body(response)?)?;
+        if !site.keys.contains(&logged.signer) {
+            bail!("the entry came back signed by a key that isn't the site's");
+        }
+        Ok(logged.open(Context::Logged, None)?)
     }
 
     /// A sealed epoch's torrent file, from the server

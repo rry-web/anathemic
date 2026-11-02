@@ -1,12 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, PublicKey, Signed, invalid};
+use crate::{
+    Error, PublicKey, Signed, invalid,
+    moderation::{ModCert, RevocationHead},
+};
 
 /// Seconds since the Unix epoch
 pub type Time = u64;
 
-/// The format version written into manifests and sealed epochs
+/// The format version written into manifests
 pub const FORMAT: u32 = 1;
+/// The format of epochs sealed now: 2 adds the index and tombstones for purged posts
+pub const EPOCH_FORMAT: u32 = 2;
 pub const MAX_TITLE: usize = 200;
 pub const MAX_BODY: usize = 20_000;
 pub const MAX_SITE_NAME: usize = 100;
@@ -154,7 +159,7 @@ impl Post {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Hash32(#[serde(with = "serde_bytes")] pub [u8; 32]);
 
 impl std::fmt::Debug for Hash32 {
@@ -184,6 +189,11 @@ pub struct SealedRef {
     /// only from manifests made before mirroring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub infohash: Option<Hash20>,
+    /// The hash of the epoch's posts, each by its own hash (see [`crate::epoch::index`]). It
+    /// stays the same when a post is purged and the bundle remade without it, so it's what the
+    /// next epoch chains to. Missing from epochs sealed before format 2, which chain to `sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<Hash32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +278,16 @@ pub struct Manifest {
     /// only the keys on it count; without one, only the site key in `site_cert`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosts: Option<Signed<Hosts>>,
+    /// The root key's appointments of moderators, each in force until the next for its key
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moderators: Vec<Signed<ModCert>>,
+    /// The revocation log's length and hash
+    #[serde(default, skip_serializing_if = "is_empty_log")]
+    pub revocations: RevocationHead,
+}
+
+fn is_empty_log(head: &RevocationHead) -> bool {
+    head.count == 0
 }
 
 impl Manifest {
@@ -287,9 +307,21 @@ pub struct Epoch {
     pub format: u32,
     pub board: String,
     pub number: u64,
-    /// The previous sealed epoch's hash, chaining the board's history
+    /// The previous sealed epoch's link (its index, or its hash before format 2), chaining
+    /// the board's history
     pub prev: Option<Hash32>,
     pub posts: Vec<Signed<Post>>,
+    /// Posts purged by moderators, by number and hash, so the index still adds up
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub purged: Vec<Tombstone>,
+}
+
+/// What's left of a purged post in its sealed epoch
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub number: u64,
+    /// The post's hash (see [`crate::epoch::post_hash`])
+    pub hash: Hash32,
 }
 
 #[cfg(test)]

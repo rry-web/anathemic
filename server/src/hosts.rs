@@ -64,6 +64,8 @@ pub struct EpochRow {
     pub closed: Option<i64>,
     #[serde(with = "serde_bytes")]
     pub sha256: Vec<u8>,
+    #[serde(default, with = "serde_bytes")]
+    pub index: Vec<u8>,
 }
 
 /// Everything about the site but its posts and bundles
@@ -88,6 +90,9 @@ pub struct PostRow {
     pub author: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub submission: Vec<u8>,
+    /// For a purged post, whose record is empty: its hash
+    #[serde(default, with = "serde_bytes")]
+    pub purged: Vec<u8>,
 }
 
 /// An anonymous post from a standby's web pages, passed on to the writer
@@ -129,7 +134,7 @@ pub fn set_host_address(dir: &Path, address: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn root_key(dir: &Path, root_key: Option<&Path>) -> anyhow::Result<SecretKey> {
+pub(crate) fn root_key(dir: &Path, root_key: Option<&Path>) -> anyhow::Result<SecretKey> {
     let path = root_key.map_or_else(|| dir.join(ROOT_KEY), Path::to_path_buf);
     let bytes = fs::read(&path).with_context(|| format!("reading the root key from {}; pass --root-key", path.display()))?;
     Ok(SecretKey::from_bytes(&bytes)?)
@@ -253,7 +258,7 @@ impl Site {
         builder.build()
     }
 
-    fn fetch(&self, address: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn fetch(&self, address: &str, path: &str) -> anyhow::Result<Vec<u8>> {
         let response = self.agent().get(&format!("http://{address}{path}")).call()?;
         let mut body = Vec::new();
         std::io::Read::read_to_end(&mut std::io::Read::take(response.into_reader(), 300 << 20), &mut body)?;
@@ -411,6 +416,8 @@ impl Site {
         set_meta(&db, "name", manifest.name.as_str())?;
         set_meta(&db, "description", manifest.description.as_str())?;
         set_meta(&db, "addresses", manifest.addresses.join("\n"))?;
+        let moderators = if manifest.moderators.is_empty() { Vec::new() } else { cbor::to_vec(&manifest.moderators) };
+        set_meta(&db, "moderators", moderators)?;
         Ok(())
     }
 
@@ -444,10 +451,11 @@ impl Site {
                     return Err(Fail::Internal(format!("the writer's bundle for /{}/ epoch {} doesn't match its hash", row.board, row.number)));
                 }
                 let infohash = torrent::bundle_hash(&bundle, &row.board, row.number as u64);
+                let index = (!row.index.is_empty()).then_some(&row.index);
                 self.db().execute(
-                    "insert or replace into epochs(board, number, state, opened, closed, sha256, bundle, infohash)
-                     values(?1, ?2, 'sealed', ?3, ?4, ?5, ?6, ?7)",
-                    params![row.board, row.number, row.opened, row.closed, row.sha256, bundle, infohash.0.to_vec()],
+                    "insert or replace into epochs(board, number, state, opened, closed, sha256, bundle, infohash, idx)
+                     values(?1, ?2, 'sealed', ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![row.board, row.number, row.opened, row.closed, row.sha256, bundle, infohash.0.to_vec(), index],
                 )?;
             } else if row.state != "sealed" {
                 self.db().execute(
@@ -466,6 +474,9 @@ impl Site {
         }
         drop(keep);
         drop(db);
+        let signed: Signed<Manifest> = cbor::from_slice(manifest)?;
+        let keys = verify::manifest(&signed, Some(&self.root))?.keys;
+        self.copy_log(address, &keys)?;
         // Last, so nobody is sent a manifest naming epochs this server doesn't hold yet
         self.adopt(manifest)?;
         Ok(set_aside)
@@ -512,9 +523,10 @@ impl Site {
     fn insert_rows(&self, rows: &[PostRow]) -> Result<(), Fail> {
         let db = self.db();
         for row in rows {
+            let purged = (!row.purged.is_empty()).then_some(&row.purged);
             db.execute(
-                "insert or ignore into posts(board, number, epoch, thread, record, author, submission) values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![row.board, row.number, row.epoch, row.thread, row.record, row.author, row.submission],
+                "insert or ignore into posts(board, number, epoch, thread, record, author, submission, purged) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![row.board, row.number, row.epoch, row.thread, row.record, row.author, row.submission, purged],
             )?;
         }
         Ok(())
@@ -542,9 +554,15 @@ impl Site {
             .collect::<Result<_, _>>()?;
         let mut set_aside = 0;
         for (number, record) in ours {
+            if record.is_empty() {
+                // Purged here; the writer's copy decides
+                db.execute("delete from posts where board = ?1 and number = ?2", params![board, number])?;
+                continue;
+            }
             if !theirs.iter().any(|row| row.number == number && row.record == record) {
                 db.execute(
-                    "insert into orphans select board, number, record, author, submission, ?3 from posts where board = ?1 and number = ?2",
+                    "insert into orphans(board, number, record, author, submission, orphaned)
+                     select board, number, record, author, submission, ?3 from posts where board = ?1 and number = ?2",
                     params![board, number, now() as i64],
                 )?;
                 db.execute("delete from posts where board = ?1 and number = ?2", params![board, number])?;
@@ -582,6 +600,20 @@ impl Site {
         bump(&db)?;
         eprintln!("Took over the site as its writer, in term {term}: {why}");
         Ok(())
+    }
+
+    /// Sends `body` to the writer's `path` and returns its answer, or its refusal
+    pub(crate) fn forward_to_writer(&self, path: &str, body: &[u8]) -> Result<Vec<u8>, Fail> {
+        let writer = self.writer_address()?;
+        match self.agent().post(&format!("http://{writer}{path}")).set("Content-Type", "application/cbor").send_bytes(body) {
+            Ok(response) => {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).map_err(|e| Fail::Internal(e.to_string()))?;
+                Ok(bytes)
+            }
+            Err(ureq::Error::Status(400, response)) => Err(Fail::Refused(response.into_string().unwrap_or_default())),
+            Err(e) => Err(Fail::Unavailable(format!("can't reach the site's writer: {e}"))),
+        }
     }
 
     /// Passes a member's post on to the writer, returning its answer
@@ -659,9 +691,17 @@ impl Site {
             .query_map([], |r| Ok(BoardRow { name: r.get(0)?, title: r.get(1)?, authors: r.get(2)?, tier: r.get(3)?, position: r.get(4)?, web: r.get(5)? }))?
             .collect::<Result<_, _>>()?;
         let epochs = db
-            .prepare("select board, number, state, opened, closed, coalesce(sha256, x'') from epochs order by board, number")?
+            .prepare("select board, number, state, opened, closed, coalesce(sha256, x''), coalesce(idx, x'') from epochs order by board, number")?
             .query_map([], |r| {
-                Ok(EpochRow { board: r.get(0)?, number: r.get(1)?, state: r.get(2)?, opened: r.get(3)?, closed: r.get(4)?, sha256: r.get(5)? })
+                Ok(EpochRow {
+                    board: r.get(0)?,
+                    number: r.get(1)?,
+                    state: r.get(2)?,
+                    opened: r.get(3)?,
+                    closed: r.get(4)?,
+                    sha256: r.get(5)?,
+                    index: r.get(6)?,
+                })
             })?
             .collect::<Result<_, _>>()?;
         Ok(HostState { manifest, boards, epochs })
@@ -670,7 +710,7 @@ impl Site {
     fn host_posts(&self, board: &str, after: i64) -> Result<Vec<PostRow>, Fail> {
         let db = self.db();
         let rows = db
-            .prepare("select board, number, epoch, thread, record, author, submission from posts where board = ?1 and number > ?2 order by number limit ?3")?
+            .prepare("select board, number, epoch, thread, record, author, submission, coalesce(purged, x'') from posts where board = ?1 and number > ?2 order by number limit ?3")?
             .query_map(params![board, after, POSTS_PAGE as i64], |r| {
                 Ok(PostRow {
                     board: r.get(0)?,
@@ -680,6 +720,7 @@ impl Site {
                     record: r.get(4)?,
                     author: r.get(5)?,
                     submission: r.get(6)?,
+                    purged: r.get(7)?,
                 })
             })?
             .collect::<Result<_, _>>()?;

@@ -1,10 +1,10 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use anathemic_core::{Authors, PublicKey, link::Link, utc};
+use anathemic_core::{Authors, PublicKey, link::Link, moderation::Power, now, utc};
 use anathemic_server::{
     Config, Site, SiteSettings, add_board,
     hosts::{self, Role},
-    init, serve, set_site, set_web_posting,
+    init, moderate, serve, set_site, set_web_posting,
 };
 use clap::{Parser, Subcommand};
 
@@ -76,6 +76,34 @@ enum Command {
     Promote,
     /// Show posts set aside when this server stepped down, which the new writer never got
     Orphans,
+    /// Appoint a moderator, or change an appointment. Moderators act with
+    /// `anathemic-client moderate`, using the member key named here (yours too, if you
+    /// moderate yourself)
+    AddModerator {
+        /// Their member key for this site, as `anathemic-client key` shows it
+        key: String,
+        #[arg(long, default_value = "")]
+        name: String,
+        /// The boards they moderate; repeat for more [default: all]
+        #[arg(long = "board")]
+        boards: Vec<String>,
+        /// hide, purge or ban; repeat for more
+        #[arg(long = "power", required = true, value_parser = parse_power)]
+        powers: Vec<Power>,
+        /// End the appointment after this many days [default: never]
+        #[arg(long)]
+        days: Option<u64>,
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+    },
+    /// End a moderator's appointment; what they did still counts
+    EndModerator {
+        key: String,
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+    },
+    /// List the moderators
+    Moderators,
     /// Add a board
     AddBoard {
         name: String,
@@ -139,6 +167,10 @@ fn parse_on_off(value: &str) -> Result<bool, String> {
         "off" => Ok(false),
         _ => Err("expected on or off".to_string()),
     }
+}
+
+fn parse_power(name: &str) -> Result<Power, String> {
+    Power::parse(name).ok_or_else(|| "expected hide, purge or ban".to_string())
 }
 
 fn parse_authors(name: &str) -> Result<Authors, String> {
@@ -269,6 +301,37 @@ async fn main() -> anyhow::Result<()> {
         Command::Promote => {
             hosts::promote(&cli.data)?;
             println!("The standby takes over at its next tick, if it's on the host list.");
+        }
+        Command::AddModerator { key, name, boards, powers, days, root_key } => {
+            let key = PublicKey::from_hex(&key)?;
+            let expires = days.map(|days| now() + days * 24 * 60 * 60);
+            moderate::add_moderator(&cli.data, root_key.as_deref(), key, &name, boards, powers, expires)?;
+            println!("Appointed {}", key.fingerprint());
+        }
+        Command::EndModerator { key, root_key } => {
+            let key = PublicKey::from_hex(&key)?;
+            moderate::end_moderator(&cli.data, root_key.as_deref(), key)?;
+            println!("Ended {}'s appointment", key.fingerprint());
+        }
+        Command::Moderators => {
+            let list = moderate::moderators(&cli.data)?;
+            if list.is_empty() {
+                println!("No moderators. Appoint one with add-moderator.");
+            }
+            for cert in list {
+                let powers: Vec<&str> = cert
+                    .powers
+                    .iter()
+                    .map(|p| match p {
+                        Power::Hide => "hide",
+                        Power::Purge => "purge",
+                        Power::Ban => "ban",
+                    })
+                    .collect();
+                let boards = if cert.boards.is_empty() { "all boards".to_string() } else { cert.boards.iter().map(|b| format!("/{b}/")).collect::<Vec<_>>().join(" ") };
+                let until = cert.expires.map_or_else(String::new, |end| format!(", until {}", utc(end)));
+                println!("{}  {}  {}: {}{until}", cert.key.fingerprint(), cert.name, boards, powers.join(", "));
+            }
         }
         Command::Orphans => {
             let orphans = hosts::orphans(&cli.data)?;
