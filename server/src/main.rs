@@ -1,7 +1,11 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use anathemic_core::Authors;
-use anathemic_server::{Config, Site, SiteSettings, add_board, init, serve, set_site, set_web_posting};
+use anathemic_core::{Authors, PublicKey, link::Link, utc};
+use anathemic_server::{
+    Config, Site, SiteSettings, add_board,
+    hosts::{self, Role},
+    init, serve, set_site, set_web_posting,
+};
 use clap::{Parser, Subcommand};
 
 /// The operator's server for an Anathemic swarmboard
@@ -37,7 +41,41 @@ enum Command {
         /// Forget the addresses set before
         #[arg(long, conflicts_with = "addresses")]
         no_addresses: bool,
+        /// This server's own I2P address, where the site's other hosts reach it: the .b32.i2p
+        /// address of a second server tunnel, not the site's shared one
+        #[arg(long)]
+        host_address: Option<String>,
     },
+    /// Let someone you trust run the site while this server is down: adds their standby to the
+    /// root key's list of hosts, after any already on it
+    AddHost {
+        /// The standby's key, as init-standby printed it
+        key: String,
+        /// The standby's own I2P address
+        #[arg(long)]
+        address: String,
+        /// Who runs it, for your records
+        #[arg(long, default_value = "")]
+        name: String,
+        /// The root key, if it isn't kept in the data folder
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+    },
+    /// Stop a host from running the site
+    RetireHost {
+        key: String,
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+    },
+    /// List the site's hosts, and whether this server is the writer
+    Hosts,
+    /// Set up a standby for a site, from its share link; then the site's operator adds it with
+    /// add-host
+    InitStandby { link: String },
+    /// Make a running standby take over the site now
+    Promote,
+    /// Show posts set aside when this server stepped down, which the new writer never got
+    Orphans,
     /// Add a board
     AddBoard {
         name: String,
@@ -79,6 +117,19 @@ enum Command {
         /// …and from each I2P destination
         #[arg(long, default_value_t = Config::default().web_posts_per_hour_each)]
         web_posts_per_hour_each: u32,
+        /// The I2P router's HTTP proxy, for reaching the site's other hosts
+        #[arg(long, default_value = "http://127.0.0.1:4444")]
+        proxy: String,
+        /// Reach the other hosts directly, not through the proxy (for hosts on this computer)
+        #[arg(long)]
+        direct: bool,
+        /// A standby takes over after the writer has been out of reach this many minutes
+        /// (0: only when told to, with promote)
+        #[arg(long, default_value_t = Config::default().takeover_seconds / 60)]
+        takeover_minutes: u64,
+        /// …plus this many for each host ranked above it
+        #[arg(long, default_value_t = Config::default().stagger_seconds / 60)]
+        stagger_minutes: u64,
     },
 }
 
@@ -110,7 +161,10 @@ async fn main() -> anyhow::Result<()> {
                  somewhere safe and offline."
             );
         }
-        Command::SetSite { name, description, addresses, no_addresses } => {
+        Command::SetSite { name, description, addresses, no_addresses, host_address } => {
+            if let Some(address) = host_address {
+                hosts::set_host_address(&cli.data, &address)?;
+            }
             let description = match description.as_deref() {
                 Some("-") => {
                     let mut text = String::new();
@@ -147,11 +201,84 @@ async fn main() -> anyhow::Result<()> {
             tick_seconds,
             web_posts_per_hour,
             web_posts_per_hour_each,
+            proxy,
+            direct,
+            takeover_minutes,
+            stagger_minutes,
         } => {
-            let config = Config { web_posts_per_hour, web_posts_per_hour_each, epoch_posts, epoch_seconds, window_seconds };
+            let config = Config {
+                web_posts_per_hour,
+                web_posts_per_hour_each,
+                epoch_posts,
+                epoch_seconds,
+                window_seconds,
+                proxy: (!direct).then_some(proxy),
+                takeover_seconds: takeover_minutes * 60,
+                stagger_seconds: stagger_minutes * 60,
+            };
             let site = Arc::new(Site::open(&cli.data, config)?);
             println!("Serving {} on http://{listen}", site.root().fingerprint());
             serve(site, listen, Duration::from_secs(tick_seconds.max(1))).await?;
+        }
+        Command::AddHost { key, address, name, root_key } => {
+            let key = PublicKey::from_hex(&key)?;
+            let rank = hosts::add_host(&cli.data, root_key.as_deref(), key, &address, &name)?;
+            println!("Added {} as host {rank}. It takes over by itself if the site's writer is out of reach.", key.fingerprint());
+            println!("Give it the site's tunnel keys too, so it answers at the site's address.");
+        }
+        Command::RetireHost { key, root_key } => {
+            let key = PublicKey::from_hex(&key)?;
+            hosts::retire_host(&cli.data, root_key.as_deref(), key)?;
+            println!("Retired {}", key.fingerprint());
+        }
+        Command::Hosts => {
+            let (list, role, term, own) = hosts::describe(&cli.data)?;
+            let role = match role {
+                Role::Writer => "the writer",
+                Role::Standby => "a standby",
+            };
+            println!("This server ({}) is {role}, in term {term}.", own.fingerprint());
+            match list {
+                None => println!("The site has no other hosts. Add one with add-host."),
+                Some(list) => {
+                    println!("Host list {} (signed {}):", list.sequence, utc(list.issued));
+                    for host in &list.hosts {
+                        println!(
+                            "  {}  {}  {}  {}{}",
+                            host.rank,
+                            host.key.fingerprint(),
+                            host.address,
+                            host.name,
+                            if host.retired { "  (retired)" } else { "" }
+                        );
+                    }
+                }
+            }
+        }
+        Command::InitStandby { link } => {
+            let link = Link::parse(&link)?;
+            let key = hosts::init_standby(&cli.data, &link)?;
+            println!("Made a standby in {} for the site with root key {}.", cli.data.display(), link.root.fingerprint());
+            println!("Its key: {}", key.to_hex());
+            println!("Next:");
+            println!("  1. Give it its own I2P address: a server tunnel to `serve`'s port, with its own keys.");
+            println!("  2. Send the operator its key and that address, for:");
+            println!("       anathemic-server add-host {} --address <its .b32.i2p> --name <you>", key.to_hex());
+            println!("  3. Run `anathemic-server --data {} serve`. It copies the site until it's needed.", cli.data.display());
+        }
+        Command::Promote => {
+            hosts::promote(&cli.data)?;
+            println!("The standby takes over at its next tick, if it's on the host list.");
+        }
+        Command::Orphans => {
+            let orphans = hosts::orphans(&cli.data)?;
+            if orphans.is_empty() {
+                println!("No posts were set aside.");
+            }
+            for (board, number, record) in orphans {
+                let post = record.peek()?;
+                println!("/{board}/ #{number}  {}\n{}\n", utc(post.accepted), post.content.body.trim_end());
+            }
         }
     }
     Ok(())

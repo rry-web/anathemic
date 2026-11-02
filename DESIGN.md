@@ -243,6 +243,28 @@ Posting requires seeding. This makes members host the site, and makes spam cost 
   cheap for a VPS, so it is combined with the measures in
   [Spam](#spam-in-the-llm-era).
 
+## Trusted hosts
+
+Mirrors keep a site readable; trusted hosts keep it running. The root key signs a host list:
+each host's own key, its own I2P address and a rank, with the operator's server at rank 0. The
+manifest carries the list, and posts and manifests signed by any listed key count (a retired
+host can no longer sign manifests, but what it signed before still counts).
+
+One host at a time is the writer. The others are standbys: they copy the writer's database over
+signed host-to-host requests, serve its manifest unchanged, and pass on posts sent to them. All
+hosts can publish the site's shared address (i2pd multihoming), so readers reach whichever is
+up. A standby that can't reach the writer for long enough takes over by signing a manifest with
+the next **term**. Clients order manifests by (term, sequence) and refuse a host list older
+than one seen, so a retired host can't carry on. Lower ranks wait longer, and a writer that
+sees a later term (or the same term from a better rank) steps down. Posts it took that the new
+writer lacks are set aside, not merged: post numbers are the site's spine, and two writers
+numbering at once is a fork.
+
+This trades availability against a short window of loss: when a writer dies, the posts since a
+standby's last copy (a tick, a minute by default) are missing from the new writer until the old
+one returns. Merging every host's posts instead (a log per host) would remove the window, at the
+cost of redesigning post numbering, threads and epochs around concurrent writers.
+
 ## Moderation and revocation
 
 The operator decides each site's policy: its rules, how moderators enforce them, and which of
@@ -484,8 +506,18 @@ holding the bundle makes the same torrent). The server tracks only its own epoch
 peer from the tunnel's `X-I2P-DestB64` header. `anathemic-node` runs librqbit behind a tracker
 proxy on localhost: librqbit announces to the proxy, which announces over SAM and swaps each I2P
 peer for a local port bridged to SAM; inbound streams are forwarded to librqbit, and an
-allowlist of 127.0.0.1 stops it dialing anything else, even peers learned by PEX. Still to do in
-this phase: relaying manifests, so clients can read from mirrors while the server is down.
+allowlist of 127.0.0.1 stops it dialing anything else, even peers learned by PEX. Each node
+also serves the site read-only over HTTP on the same destination (an inbound stream starting with
+BitTorrent's byte 19 goes to librqbit, anything else to HTTP), from the cache the client keeps:
+the signed manifest, sealed bundles and open epochs' posts. Nodes add `mirror=1` to announces,
+the server lists those seeders at `/mirrors`, and clients fall back to them when the server is
+unreachable, taking the newest manifest from the first three that answer. Nodes also give the
+known mirrors to librqbit as peers, so swarms carry on while the tracker is down. Mirrors also draw
+the server's web pages from their checked copy, read-only, and share links
+(`anathemic:<address>?root=…&mirror=…`) let someone start reading or mirroring a site, with the
+right root key, while its server is down. Still open:
+publishing the manifest somewhere other than the server and its mirrors (BEP 46), and finding
+mirrors without ever having reached the server.
 
 ## Open questions
 

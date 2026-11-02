@@ -57,6 +57,26 @@ pub fn b32_address(hash: &[u8; 32]) -> String {
     out + ".b32.i2p"
 }
 
+/// The hash behind a `.b32.i2p` address
+pub fn b32_hash(address: &str) -> Option<[u8; 32]> {
+    let name = address.strip_suffix(".b32.i2p")?;
+    if name.len() != 52 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(33);
+    let mut bits = 0u64;
+    let mut count = 0;
+    for c in name.bytes() {
+        bits = bits << 5 | BASE32.iter().position(|&b| b == c)? as u64;
+        count += 5;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    out.try_into().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +88,9 @@ mod tests {
         let mut hash = [0u8; 32];
         hash[0] = 0b0000_1000;
         assert!(b32_address(&hash).starts_with("baaa"));
+        let hash: [u8; 32] = std::array::from_fn(|i| (i * 37 + 11) as u8);
+        assert_eq!(b32_hash(&b32_address(&hash)), Some(hash));
+        assert_eq!(b32_hash("forum.i2p"), None);
 
         // 387 bytes of 0xff, then two zero bytes: I2P's base64 uses ~ for 63
         let destination: Vec<u8> = [vec![0xff; 387], vec![0, 0]].concat();

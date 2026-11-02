@@ -201,6 +201,46 @@ pub struct BoardEntry {
     pub web_posting: bool,
 }
 
+/// One of the servers the root key allows to run the site
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Host {
+    pub key: PublicKey,
+    /// 0 for the operator's own server; standbys take over in order of rank
+    pub rank: u8,
+    /// The host's own I2P address, where the site's servers reach each other (each also
+    /// answers at the site's shared address)
+    pub address: String,
+    /// Who runs it, for the operator's records
+    pub name: String,
+    /// No longer allowed to publish the site; the posts it signed still count
+    #[serde(default)]
+    pub retired: bool,
+}
+
+/// The servers allowed to run the site, signed by the root key. While one is down, the next by
+/// rank takes over, so the site keeps taking posts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Hosts {
+    /// Rises with every change; clients never accept a lower one than they've seen
+    pub sequence: u64,
+    pub issued: Time,
+    pub hosts: Vec<Host>,
+}
+
+impl Hosts {
+    pub fn get(&self, key: &PublicKey) -> Option<&Host> {
+        self.hosts.iter().find(|host| host.key == *key)
+    }
+}
+
+/// What one of a site's servers asks another for; signed with its host key
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostRequest {
+    /// The path and query asked for, without this request
+    pub path: String,
+    pub time: Time,
+}
+
 /// The site's current state; travels signed by the site key
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
@@ -220,6 +260,14 @@ pub struct Manifest {
     #[serde(default)]
     pub addresses: Vec<String>,
     pub boards: Vec<BoardEntry>,
+    /// Rises each time a different server takes over the site. A manifest from a higher term
+    /// wins over any from a lower one, whatever their sequence numbers.
+    #[serde(default)]
+    pub term: u64,
+    /// The servers allowed to run the site, when there's more than the first. With a list,
+    /// only the keys on it count; without one, only the site key in `site_cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Signed<Hosts>>,
 }
 
 impl Manifest {

@@ -4,11 +4,20 @@
 //! The server renders these from its own records, so a reader trusts the server for what they
 //! show. The dedicated client verifies every signature instead. Boards can also take anonymous
 //! posts from these pages, which no member signs.
+//!
+//! Mirrors draw the same pages, read-only, from their checked copy of the site ([`Source`]), so
+//! the site stays readable in a browser while its server is down.
 
-use std::{collections::HashSet, fmt::Write, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write,
+    sync::Arc,
+};
 
 use anathemic_core::{
-    Authors, Content, Post, now, utc, valid_board_name,
+    Authors, Content, Post, PublicKey, Signed, Time,
+    link::Link,
+    now, utc, valid_board_name,
     markup::{self, Block, Inline},
 };
 use axum::{
@@ -20,21 +29,82 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{EpochState, Fail, Site};
+use crate::{BoardSummary, EpochState, Fail, Site, ThreadSummary, refuse};
 
 /// Board names the server's own addresses use
-pub const RESERVED: &[&str] = &["announce", "boards", "manifest", "static"];
+pub const RESERVED: &[&str] = &["announce", "boards", "manifest", "mirrors", "static"];
 const THREADS_PER_PAGE: u64 = 50;
 /// The header an i2pd HTTP server tunnel adds, naming the visitor's destination
 const DESTINATION_HEADER: &str = "x-i2p-desthash";
 
-pub fn routes() -> Router<Arc<Site>> {
+/// What the pages are drawn from: the server's own records, or a mirror's checked copy
+pub trait Source: Send + Sync + 'static {
+    fn root(&self) -> PublicKey;
+    /// The site's name, description and addresses
+    fn about(&self) -> Result<(String, String, Vec<String>), Fail>;
+    fn boards(&self) -> Result<Vec<BoardSummary>, Fail>;
+    /// A board's title, author rule, and whether these pages take posts for it
+    fn board(&self, board: &str) -> Result<(String, Authors, bool), Fail>;
+    /// A page of a board's threads, the most recently active first, and how many there are
+    fn threads(&self, board: &str, skip: u64, take: u64) -> Result<(Vec<ThreadSummary>, u64), Fail>;
+    /// A thread's posts in order, its first post first
+    fn thread(&self, board: &str, number: u64) -> Result<Vec<Post>, Fail>;
+    /// The thread a post belongs to
+    fn thread_of(&self, board: &str, number: u64) -> Result<u64, Fail>;
+    fn epoch_states(&self, board: &str) -> Result<HashMap<u64, EpochState>, Fail>;
+    /// For a mirror, when the manifest its copy follows was published
+    fn mirrored(&self) -> Option<Time> {
+        None
+    }
+    /// Mirrors' addresses to put in the share link
+    fn mirrors(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn submit_web(&self, _board: &str, _content: Content, _from: Option<&str>, _now: u64) -> Result<Signed<Post>, Fail> {
+        refuse("this is a read-only mirror; post on the site itself")
+    }
+}
+
+impl Source for Site {
+    fn root(&self) -> PublicKey {
+        Site::root(self)
+    }
+    fn about(&self) -> Result<(String, String, Vec<String>), Fail> {
+        Site::about(self)
+    }
+    fn boards(&self) -> Result<Vec<BoardSummary>, Fail> {
+        Site::boards(self)
+    }
+    fn board(&self, board: &str) -> Result<(String, Authors, bool), Fail> {
+        Site::board(self, board)
+    }
+    fn threads(&self, board: &str, skip: u64, take: u64) -> Result<(Vec<ThreadSummary>, u64), Fail> {
+        Site::threads(self, board, skip, take)
+    }
+    fn thread(&self, board: &str, number: u64) -> Result<Vec<Post>, Fail> {
+        Site::thread(self, board, number)
+    }
+    fn thread_of(&self, board: &str, number: u64) -> Result<u64, Fail> {
+        Site::thread_of(self, board, number)
+    }
+    fn epoch_states(&self, board: &str) -> Result<HashMap<u64, EpochState>, Fail> {
+        Site::epoch_states(self, board)
+    }
+    fn submit_web(&self, board: &str, content: Content, from: Option<&str>, now: u64) -> Result<Signed<Post>, Fail> {
+        Site::submit_web(self, board, content, from, now)
+    }
+    fn mirrors(&self) -> Vec<String> {
+        self.tracker.mirrors(now(), 3).iter().map(anathemic_core::i2p::b32_address).collect()
+    }
+}
+
+pub fn routes<S: Source>() -> Router<Arc<S>> {
     Router::new()
-        .route("/", get(index))
+        .route("/", get(index::<S>))
         .route("/{board}", get(to_board))
-        .route("/{board}/", get(board).post(new_thread))
-        .route("/{board}/{thread}", get(thread).post(new_reply))
-        .route("/{board}/post/{number}", get(post))
+        .route("/{board}/", get(board::<S>).post(new_thread::<S>))
+        .route("/{board}/{thread}", get(thread::<S>).post(new_reply::<S>))
+        .route("/{board}/post/{number}", get(post::<S>))
 }
 
 /// Text made safe for HTML, inside elements and in quoted attributes
@@ -71,14 +141,30 @@ struct About {
     address: Option<String>,
 }
 
-fn about(site: &Site) -> Result<About, Fail> {
+fn about(site: &impl Source) -> Result<About, Fail> {
     let (name, description, addresses) = site.about()?;
     let title = if name.is_empty() { format!("Site {}", site.root().fingerprint()) } else { name };
     Ok(About { title, description, address: addresses.into_iter().next() })
 }
 
-fn page(site: &Site, about: &About, title: &str, crumbs: &[(&str, &str)], body: &str) -> Response {
+fn page(site: &impl Source, about: &About, title: &str, crumbs: &[(&str, &str)], body: &str) -> Response {
     let mut nav = format!("<a href=\"/\">{}</a>", escape(&about.title));
+    let (banner, drawn) = match site.mirrored() {
+        Some(published) => {
+            let at = about.address.as_ref().map_or_else(String::new, |a| format!(" at <a href=\"http://{a}/\">{a}</a>", a = escape(a)));
+            (
+                format!(
+                    "<p class=\"refused\">This is a read-only mirror of {}, kept by one of its members. \
+                     It follows the site as it was at {}, so newer posts may be missing. \
+                     To post, use the site itself{at}.</p>\n",
+                    escape(&about.title),
+                    utc(published)
+                ),
+                "These pages are drawn by a mirror, from a copy whose signatures it checked",
+            )
+        }
+        None => (String::new(), "These pages are drawn by the server"),
+    };
     for (href, label) in crumbs {
         let _ = write!(nav, " · <a href=\"{}\">{}</a>", escape(href), escape(label));
     }
@@ -87,11 +173,12 @@ fn page(site: &Site, about: &About, title: &str, crumbs: &[(&str, &str)], body: 
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{title}</title><style>{STYLE}</style></head><body>\
-         <nav>{nav}</nav>\n{body}\n<footer><p>An Anathemic swarmboard. Root key {fingerprint} \
-         (<code>{root}</code>). These pages are drawn by the server; the anathemic client checks \
-         every signature itself.</p></footer></body></html>\n",
+         <nav>{nav}</nav>\n{banner}{body}\n<footer><p>An Anathemic swarmboard. Root key {fingerprint} \
+         (<code>{root}</code>). {drawn}; the anathemic client checks every signature \
+         itself.</p>{share}</footer></body></html>\n",
         fingerprint = site.root().fingerprint(),
         root = site.root().to_hex(),
+        share = share(site, about),
     );
     let mut response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
     let headers = response.headers_mut();
@@ -102,6 +189,17 @@ fn page(site: &Site, about: &About, title: &str, crumbs: &[(&str, &str)], body: 
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
+}
+
+/// The site's share link, for anyone who wants to help keep it up
+fn share(site: &impl Source, about: &About) -> String {
+    let Some(address) = &about.address else { return String::new() };
+    let link = Link { address: address.clone(), root: site.root(), mirrors: site.mirrors() };
+    format!(
+        "<p>To help keep this site up by mirroring it, run <code>anathemic-node '{}'</code> \
+         beside an I2P router with SAM on.</p>",
+        escape(&link.to_string())
+    )
 }
 
 fn plural(count: u64, one: &str, many: &str) -> String {
@@ -121,8 +219,8 @@ async fn to_board(Path(name): Path<String>) -> Result<Response, Fail> {
     Ok(Redirect::permanent(&format!("/{name}/")).into_response())
 }
 
-async fn index(State(site): State<Arc<Site>>) -> Result<Response, Fail> {
-    let about = about(&site)?;
+async fn index<S: Source>(State(site): State<Arc<S>>) -> Result<Response, Fail> {
+    let about = about(&*site)?;
     let boards = site.boards()?;
     let mut body = format!("<h1>{}</h1>\n", escape(&about.title));
     body.push_str(&render_markup(&about.description, "", &|_| false));
@@ -143,7 +241,7 @@ async fn index(State(site): State<Arc<Site>>) -> Result<Response, Fail> {
         }
         body.push_str("</table>");
     }
-    Ok(page(&site, &about, &about.title, &[], &body))
+    Ok(page(&*site, &about, &about.title, &[], &body))
 }
 
 #[derive(Deserialize)]
@@ -160,11 +258,11 @@ struct Draft {
     body: String,
 }
 
-async fn board(State(site): State<Arc<Site>>, Path(name): Path<String>, Query(query): Query<PageQuery>) -> Result<Response, Fail> {
-    board_page(&site, &name, query.page.unwrap_or(1), None, &Draft::default())
+async fn board<S: Source>(State(site): State<Arc<S>>, Path(name): Path<String>, Query(query): Query<PageQuery>) -> Result<Response, Fail> {
+    board_page(&*site, &name, query.page.unwrap_or(1), None, &Draft::default())
 }
 
-fn board_page(site: &Site, name: &str, number: u64, refused: Option<&str>, draft: &Draft) -> Result<Response, Fail> {
+fn board_page(site: &impl Source, name: &str, number: u64, refused: Option<&str>, draft: &Draft) -> Result<Response, Fail> {
     let about = about(site)?;
     let (title, authors, web) = site.board(name)?;
     let number = number.max(1);
@@ -254,11 +352,11 @@ fn authors_rule(authors: Authors) -> &'static str {
     }
 }
 
-async fn thread(State(site): State<Arc<Site>>, Path((name, number)): Path<(String, u64)>) -> Result<Response, Fail> {
-    thread_page(&site, &name, number, None, &Draft::default())
+async fn thread<S: Source>(State(site): State<Arc<S>>, Path((name, number)): Path<(String, u64)>) -> Result<Response, Fail> {
+    thread_page(&*site, &name, number, None, &Draft::default())
 }
 
-fn thread_page(site: &Arc<Site>, name: &str, number: u64, refused: Option<&str>, draft: &Draft) -> Result<Response, Fail> {
+fn thread_page(site: &impl Source, name: &str, number: u64, refused: Option<&str>, draft: &Draft) -> Result<Response, Fail> {
     let about = about(site)?;
     let (board_title, _, web) = site.board(name)?;
     let posts = match site.thread(name, number) {
@@ -305,11 +403,11 @@ fn thread_page(site: &Arc<Site>, name: &str, number: u64, refused: Option<&str>,
 }
 
 /// Sends a link to a post on to its place in its thread
-async fn post(State(site): State<Arc<Site>>, Path((name, number)): Path<(String, u64)>) -> Result<Response, Fail> {
-    to_post(&site, &name, number)
+async fn post<S: Source>(State(site): State<Arc<S>>, Path((name, number)): Path<(String, u64)>) -> Result<Response, Fail> {
+    to_post(&*site, &name, number)
 }
 
-fn to_post(site: &Site, name: &str, number: u64) -> Result<Response, Fail> {
+fn to_post(site: &impl Source, name: &str, number: u64) -> Result<Response, Fail> {
     let thread = site.thread_of(name, number)?;
     Ok(Redirect::to(&format!("/{name}/{thread}#p{number}")).into_response())
 }
@@ -323,32 +421,40 @@ fn tidy(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-async fn new_thread(
-    State(site): State<Arc<Site>>,
+async fn new_thread<S: Source>(
+    State(site): State<Arc<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     Form(draft): Form<Draft>,
 ) -> Result<Response, Fail> {
     let content = Content { thread: None, title: Some(draft.title.trim().to_string()), body: tidy(&draft.body) };
-    match site.submit_web(&name, content, destination(&headers).as_deref(), now()) {
+    match submit(&site, &name, content, destination(&headers)).await {
         Ok(record) => posted(&name, record),
-        Err(Fail::Refused(reason)) => refused(board_page(&site, &name, 1, Some(&reason), &draft)),
+        Err(Fail::Refused(reason)) => refused(board_page(&*site, &name, 1, Some(&reason), &draft)),
         Err(other) => Err(other),
     }
 }
 
-async fn new_reply(
-    State(site): State<Arc<Site>>,
+async fn new_reply<S: Source>(
+    State(site): State<Arc<S>>,
     Path((name, thread)): Path<(String, u64)>,
     headers: HeaderMap,
     Form(draft): Form<Draft>,
 ) -> Result<Response, Fail> {
     let content = Content { thread: Some(thread), title: None, body: tidy(&draft.body) };
-    match site.submit_web(&name, content, destination(&headers).as_deref(), now()) {
+    match submit(&site, &name, content, destination(&headers)).await {
         Ok(record) => posted(&name, record),
-        Err(Fail::Refused(reason)) => refused(thread_page(&site, &name, thread, Some(&reason), &draft)),
+        Err(Fail::Refused(reason)) => refused(thread_page(&*site, &name, thread, Some(&reason), &draft)),
         Err(other) => Err(other),
     }
+}
+
+/// Posts off the async threads: a standby passes the post on to the writer over I2P
+async fn submit<S: Source>(site: &Arc<S>, board: &str, content: Content, from: Option<String>) -> Result<Signed<Post>, Fail> {
+    let (site, board) = (site.clone(), board.to_string());
+    tokio::task::spawn_blocking(move || site.submit_web(&board, content, from.as_deref(), now()))
+        .await
+        .map_err(|e| Fail::Internal(e.to_string()))?
 }
 
 /// On to the new post, as a GET, so reloading doesn't post again

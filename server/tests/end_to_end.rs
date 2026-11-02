@@ -19,7 +19,7 @@ fn start(dir: &std::path::Path) -> Running {
     add_board(dir, "general", "General", Authors::Choice).unwrap();
     add_board(dir, "named", "Names shown", Authors::Shown).unwrap();
     add_board(dir, "masks", "Names hidden", Authors::Hidden).unwrap();
-    let config = Config { epoch_posts: 3, epoch_seconds: 3600, window_seconds: 60, web_posts_per_hour: 5, web_posts_per_hour_each: 2 };
+    let config = Config { epoch_posts: 3, epoch_seconds: 3600, window_seconds: 60, web_posts_per_hour: 5, web_posts_per_hour_each: 2, ..Default::default() };
     let site = Arc::new(Site::open(dir, config).unwrap());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
@@ -304,9 +304,13 @@ fn sites_made_by_the_first_prototype_still_open() {
 
 /// An announce to the site's tracker, as if through the I2P tunnel from `destination`
 fn announce(url: &str, infohash: &[u8; 20], destination: Option<&str>, seeding: bool) -> bencode::Value {
+    announce_as(url, infohash, destination, seeding, false)
+}
+
+fn announce_as(url: &str, infohash: &[u8; 20], destination: Option<&str>, seeding: bool, mirror: bool) -> bencode::Value {
     let escaped: String = infohash.iter().map(|b| format!("%{b:02X}")).collect();
     let left = if seeding { 0 } else { 1000 };
-    let mut request = ureq::get(&format!("{url}/announce?info_hash={escaped}&peer_id=-XX0001-000000000000&port=6881&uploaded=0&downloaded=0&left={left}&compact=1"));
+    let mut request = ureq::get(&format!("{url}/announce?info_hash={escaped}&peer_id=-XX0001-000000000000&port=6881&uploaded=0&downloaded=0&left={left}&compact=1{}", if mirror { "&mirror=1" } else { "" }));
     if let Some(destination) = destination {
         request = request.set("X-I2P-DestB64", destination);
     }
@@ -357,6 +361,11 @@ fn sealed_epochs_are_torrents_the_site_tracks() {
     let seeder_hash = i2p::destination_hash(&i2p::decode_destination(&seeder).unwrap());
     assert_eq!(second.get("peers").unwrap().bytes().unwrap(), seeder_hash);
     assert_eq!(second.get("complete").unwrap().int(), Some(1));
+
+    // Seeders that serve the site over HTTP are listed as mirrors
+    assert_eq!(get_page(&format!("{}/mirrors", server.url)).1, "");
+    announce_as(&server.url, &infohash.0, Some(&seeder), true, true);
+    assert_eq!(get_page(&format!("{}/mirrors", server.url)).1, format!("{}\n", i2p::b32_address(&seeder_hash)));
 
     // Epochs sealed before mirroring get their info hashes when the site is next opened
     let db = rusqlite::Connection::open(server.dir.join("site.db")).unwrap();

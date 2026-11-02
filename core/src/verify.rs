@@ -1,10 +1,15 @@
-use crate::{Context, Error, Manifest, PublicKey, Signed, check_site_text, invalid, valid_address, valid_board_name};
+use crate::{Context, Error, Manifest, PublicKey, Signed, check_site_text, invalid, link::valid_host, valid_address, valid_board_name};
 
-/// A manifest whose signatures check out, with the site key it vouches for
+/// A manifest whose signatures check out, with the keys it vouches for
 #[derive(Clone, Debug)]
 pub struct Verified {
     pub manifest: Manifest,
+    /// The server that published it
     pub site_key: PublicKey,
+    /// The keys whose posts count: every host on the root key's list, or the site key alone
+    pub keys: Vec<PublicKey>,
+    /// The sequence of the host list it carries, 0 if none
+    pub hosts_sequence: u64,
 }
 
 /// Checks the root key's certificate for the site key, then the site key's signature.
@@ -19,7 +24,22 @@ pub fn manifest(signed: &Signed<Manifest>, pinned: Option<&PublicKey>) -> Result
         )));
     }
     let cert = claimed.site_cert.open(Context::SiteCert, Some(&claimed.root))?;
-    let manifest = signed.open(Context::Manifest, Some(&cert.site_key))?;
+    let (keys, publishers, hosts_sequence) = match &claimed.hosts {
+        Some(hosts) => {
+            let hosts = hosts.open(Context::Hosts, Some(&claimed.root))?;
+            if let Some(host) = hosts.hosts.iter().find(|host| !valid_host(&host.address)) {
+                return Err(invalid(format!("host {:?} isn't an I2P address", host.address)));
+            }
+            let keys = hosts.hosts.iter().map(|host| host.key).collect();
+            let publishers = hosts.hosts.iter().filter(|host| !host.retired).map(|host| host.key).collect();
+            (keys, publishers, hosts.sequence)
+        }
+        None => (vec![cert.site_key], vec![cert.site_key], 0),
+    };
+    if !publishers.contains(&signed.signer) {
+        return Err(Error::WrongSigner);
+    }
+    let manifest = signed.open(Context::Manifest, None)?;
     check_site_text(&manifest.name, &manifest.description)?;
     if let Some(address) = manifest.addresses.iter().find(|a| !valid_address(a)) {
         return Err(invalid(format!("{address:?} isn't an I2P address")));
@@ -35,7 +55,7 @@ pub fn manifest(signed: &Signed<Manifest>, pinned: Option<&PublicKey>) -> Result
             return Err(invalid(format!("board {}'s epochs have gaps", board.name)));
         }
     }
-    Ok(Verified { manifest, site_key: cert.site_key })
+    Ok(Verified { manifest, site_key: signed.signer, keys, hosts_sequence })
 }
 
 #[cfg(test)]
@@ -55,6 +75,8 @@ mod tests {
             description: String::new(),
             addresses: vec![],
             boards: vec![],
+            term: 0,
+            hosts: None,
         };
         site.sign(Context::Manifest, &manifest)
     }
@@ -85,5 +107,35 @@ mod tests {
         assert!(manifest(&site.sign(Context::Manifest, &fields), None).is_err());
         fields.addresses.pop();
         assert!(manifest(&site.sign(Context::Manifest, &fields), None).is_ok());
+    }
+
+    #[test]
+    fn hosts_on_the_root_keys_list_can_publish() {
+        use crate::{Host, Hosts};
+        let root = SecretKey::generate();
+        let site = SecretKey::generate();
+        let standby = SecretKey::generate();
+        let retired = SecretKey::generate();
+        let host = |key: &SecretKey, rank, retired| Host {
+            key: key.public(),
+            rank,
+            address: format!("{}.b32.i2p", "a".repeat(52)),
+            name: String::new(),
+            retired,
+        };
+        let hosts = Hosts { sequence: 2, issued: 0, hosts: vec![host(&site, 0, false), host(&standby, 1, false), host(&retired, 2, true)] };
+        let mut fields = signed(&root, &site).peek().unwrap();
+        fields.hosts = Some(root.sign(Context::Hosts, &hosts));
+        fields.term = 1;
+
+        let verified = manifest(&standby.sign(Context::Manifest, &fields), Some(&root.public())).unwrap();
+        assert_eq!(verified.site_key, standby.public());
+        assert_eq!((verified.keys.len(), verified.hosts_sequence), (3, 2));
+        assert!(manifest(&retired.sign(Context::Manifest, &fields), None).is_err());
+        assert!(manifest(&SecretKey::generate().sign(Context::Manifest, &fields), None).is_err());
+
+        // A host list signed by anyone but the root key counts for nothing
+        fields.hosts = Some(standby.sign(Context::Hosts, &hosts));
+        assert!(manifest(&standby.sign(Context::Manifest, &fields), None).is_err());
     }
 }

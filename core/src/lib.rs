@@ -8,6 +8,7 @@ pub mod cbor;
 pub mod epoch;
 pub mod i2p;
 pub mod keys;
+pub mod link;
 pub mod markup;
 pub mod model;
 pub mod torrent;

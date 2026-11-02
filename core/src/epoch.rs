@@ -39,14 +39,17 @@ pub fn open_bundle(bundle: &[u8], expected: &SealedRef) -> Result<Epoch, Error> 
     cbor::from_slice(&decoded)
 }
 
-/// Checks a post the site key signed, and the author's signature if it shows one
+/// Checks a post one of the site's `keys` signed, and the author's signature if it shows one
 pub fn check_post(
     signed: &Signed<Post>,
-    site_key: &PublicKey,
+    keys: &[PublicKey],
     board: &str,
     epoch: u64,
 ) -> Result<Post, Error> {
-    let post = signed.open(Context::Post, Some(site_key))?;
+    if !keys.contains(&signed.signer) {
+        return Err(Error::WrongSigner);
+    }
+    let post = signed.open(Context::Post, None)?;
     if post.board != board || post.epoch != epoch {
         return Err(invalid(format!("post {} is filed in the wrong place", post.number)));
     }
@@ -69,7 +72,7 @@ pub fn check_epoch(
     board: &str,
     number: u64,
     prev: Option<Hash32>,
-    site_key: &PublicKey,
+    keys: &[PublicKey],
 ) -> Result<Vec<Post>, Error> {
     if epoch.board != board || epoch.number != number {
         return Err(invalid(format!("epoch {number} is filed in the wrong place")));
@@ -80,7 +83,7 @@ pub fn check_epoch(
     let posts = epoch
         .posts
         .iter()
-        .map(|signed| check_post(signed, site_key, board, number))
+        .map(|signed| check_post(signed, keys, board, number))
         .collect::<Result<Vec<_>, _>>()?;
     check_order(&posts)?;
     Ok(posts)
@@ -141,11 +144,11 @@ mod tests {
         let (bundle, hash) = seal(&first);
         let entry = SealedRef { epoch: 0, sha256: hash, size: bundle.len() as u64, infohash: None };
         let opened = open_bundle(&bundle, &entry).unwrap();
-        assert_eq!(check_epoch(&opened, "general", 0, None, &site.public()).unwrap().len(), 2);
+        assert_eq!(check_epoch(&opened, "general", 0, None, &[site.public()]).unwrap().len(), 2);
 
         let second = epoch(&site, 1, Some(hash), &[3]);
-        assert!(check_epoch(&second, "general", 1, Some(hash), &site.public()).is_ok());
-        assert!(check_epoch(&second, "general", 1, None, &site.public()).is_err());
+        assert!(check_epoch(&second, "general", 1, Some(hash), &[site.public()]).is_ok());
+        assert!(check_epoch(&second, "general", 1, None, &[site.public()]).is_err());
     }
 
     #[test]
@@ -158,10 +161,10 @@ mod tests {
 
         let stranger = SecretKey::generate();
         let forged = epoch(&stranger, 0, None, &[1]);
-        assert!(check_epoch(&forged, "general", 0, None, &site.public()).is_err());
+        assert!(check_epoch(&forged, "general", 0, None, &[site.public()]).is_err());
 
         let shuffled = epoch(&site, 0, None, &[2, 1]);
-        assert!(check_epoch(&shuffled, "general", 0, None, &site.public()).is_err());
+        assert!(check_epoch(&shuffled, "general", 0, None, &[site.public()]).is_err());
     }
 
     #[test]
@@ -171,6 +174,6 @@ mod tests {
         let mut post = post(&site, &author, 1, 0).peek().unwrap();
         post.content.body = "words the author never wrote".into();
         let resigned = site.sign(Context::Post, &post);
-        assert!(check_post(&resigned, &site.public(), "general", 0).is_err());
+        assert!(check_post(&resigned, &[site.public()], "general", 0).is_err());
     }
 }

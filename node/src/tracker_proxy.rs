@@ -107,10 +107,14 @@ impl Proxy {
     }
 }
 
-/// librqbit's query, asking the I2P tracker for the compact form
+/// librqbit's query, asking the I2P tracker for the compact form, and saying this node serves
+/// the site over HTTP too
 fn compact(query: &str) -> String {
-    let mut pairs: Vec<&str> = query.split('&').filter(|pair| !pair.is_empty() && !pair.starts_with("compact=")).collect();
-    pairs.push("compact=1");
+    let mut pairs: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("compact=") && !pair.starts_with("mirror="))
+        .collect();
+    pairs.extend(["compact=1", "mirror=1"]);
     pairs.join("&")
 }
 
@@ -152,7 +156,7 @@ fn failure(reason: &str) -> Response {
 mod tests {
     #[test]
     fn asks_for_compact_replies() {
-        assert_eq!(super::compact("info_hash=x&compact=0&left=1"), "info_hash=x&left=1&compact=1");
-        assert_eq!(super::compact(""), "compact=1");
+        assert_eq!(super::compact("info_hash=x&compact=0&left=1"), "info_hash=x&left=1&compact=1&mirror=1");
+        assert_eq!(super::compact(""), "compact=1&mirror=1");
     }
 }

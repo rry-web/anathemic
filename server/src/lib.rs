@@ -27,6 +27,8 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+pub mod hosts;
+pub mod snapshot;
 pub mod tracker;
 pub mod web;
 
@@ -47,6 +49,12 @@ pub struct Config {
     pub epoch_seconds: u64,
     /// How long a closed epoch stays open to moderation before it's sealed
     pub window_seconds: u64,
+    /// The I2P router's HTTP proxy, for reaching the site's other hosts
+    pub proxy: Option<String>,
+    /// A standby takes over after the writer has been out of reach this long (0: never by itself)…
+    pub takeover_seconds: u64,
+    /// …plus this long for each host ranked above it, so they don't all take over at once
+    pub stagger_seconds: u64,
 }
 
 impl Default for Config {
@@ -55,6 +63,9 @@ impl Default for Config {
             web_posts_per_hour: 30,
             web_posts_per_hour_each: 6,
             epoch_posts: 500, epoch_seconds: 7 * 24 * 60 * 60, window_seconds: 72 * 60 * 60,
+            proxy: None,
+            takeover_seconds: 30 * 60,
+            stagger_seconds: 10 * 60,
         }
     }
 }
@@ -72,6 +83,15 @@ pub fn init(dir: &Path) -> anyhow::Result<PublicKey> {
     let cert = root.sign(Context::SiteCert, &SiteCert { site_key: site.public(), issued: now() });
 
     let db = Connection::open(dir.join(DATABASE))?;
+    create_tables(&db)?;
+    db.execute("insert into meta values('root', ?1)", [root.public().0.to_vec()])?;
+    db.execute("insert into meta values('site_cert', ?1)", [cbor::to_vec(&cert)])?;
+    db.execute("insert into meta values('sequence', 0)", [])?;
+    migrate(&db)?;
+    Ok(root.public())
+}
+
+fn create_tables(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "create table meta(key text primary key, value blob not null);
          create table boards(name text primary key, title text not null, authors text not null,
@@ -82,12 +102,7 @@ pub fn init(dir: &Path) -> anyhow::Result<PublicKey> {
          create table posts(board text not null, number integer not null, epoch integer not null,
                             thread integer, record blob not null, author blob not null,
                             submission blob not null unique, primary key(board, number));",
-    )?;
-    db.execute("insert into meta values('root', ?1)", [root.public().0.to_vec()])?;
-    db.execute("insert into meta values('site_cert', ?1)", [cbor::to_vec(&cert)])?;
-    db.execute("insert into meta values('sequence', 0)", [])?;
-    migrate(&db)?;
-    Ok(root.public())
+    )
 }
 
 /// Brings a database made by an older version up to date
@@ -106,6 +121,15 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
         "insert or ignore into meta values('name', '');
          insert or ignore into meta values('description', '');
          insert or ignore into meta values('addresses', '');
+         insert or ignore into meta values('term', 0);
+         insert or ignore into meta values('role', 'writer');
+         insert or ignore into meta values('host_address', '');
+         insert or ignore into meta values('hosts', x'');
+         insert or ignore into meta values('relayed', x'');
+         insert or ignore into meta values('promote', 0);
+         insert or ignore into meta values('follow', '');
+         create table if not exists orphans(board text not null, number integer not null, record blob not null,
+                                            author blob not null, submission blob not null, orphaned integer not null);
          create index if not exists posts_by_thread on posts(board, thread, number);
          create index if not exists epochs_by_infohash on epochs(infohash);",
     )?;
@@ -212,6 +236,10 @@ pub enum Fail {
     Refused(String),
     NotFound,
     Internal(String),
+    /// Can't answer now, as when a standby can't reach the writer
+    Unavailable(String),
+    /// A host-only request without a good signature
+    Forbidden,
 }
 
 impl From<anathemic_core::Error> for Fail {
@@ -231,6 +259,8 @@ impl IntoResponse for Fail {
         match self {
             Fail::Refused(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             Fail::NotFound => StatusCode::NOT_FOUND.into_response(),
+            Fail::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+            Fail::Forbidden => StatusCode::FORBIDDEN.into_response(),
             Fail::Internal(message) => {
                 eprintln!("internal error: {message}");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -247,8 +277,9 @@ pub struct Site {
     db: Mutex<Connection>,
     key: SecretKey,
     root: PublicKey,
-    cert: Signed<SiteCert>,
     config: Config,
+    /// When a standby last copied the writer
+    last_contact: Mutex<Time>,
     /// When recent web posts were made, by board and by board and destination
     web_posts: Mutex<HashMap<String, Vec<Time>>>,
     /// Who holds which sealed epochs
@@ -263,11 +294,29 @@ impl Site {
             Ok(db.query_row("select value from meta where key = ?1", [name], |r| r.get(0))?)
         };
         let root = PublicKey(meta("root")?.try_into().map_err(|_| anyhow::anyhow!("bad root key"))?);
-        let cert: Signed<SiteCert> = cbor::from_slice(&meta("site_cert")?)?;
-        if cert.open(Context::SiteCert, Some(&root))?.site_key != key.public() {
+        // The operator's server holds the key the site certificate names; other hosts are on
+        // the root key's host list, or are standbys waiting to be added to it
+        let certified = match cbor::from_slice::<Signed<SiteCert>>(&meta("site_cert")?) {
+            Ok(cert) => cert.open(Context::SiteCert, Some(&root))?.site_key == key.public(),
+            Err(_) => false,
+        };
+        let listed = hosts::load_hosts(&db)
+            .map_err(|f| anyhow::anyhow!("{f:?}"))?
+            .map(|signed| signed.open(Context::Hosts, Some(&root)))
+            .transpose()?
+            .is_some_and(|list| list.get(&key.public()).is_some());
+        if !certified && !listed && hosts::role(&db)? == hosts::Role::Writer {
             bail!("{SITE_KEY} isn't the key the root key certified");
         }
-        Ok(Site { db: Mutex::new(db), key, root, cert, config, web_posts: Mutex::new(HashMap::new()), tracker: Default::default() })
+        Ok(Site {
+            db: Mutex::new(db),
+            key,
+            root,
+            config,
+            last_contact: Mutex::new(now()),
+            web_posts: Mutex::new(HashMap::new()),
+            tracker: Default::default(),
+        })
     }
 
     pub fn root(&self) -> PublicKey {
@@ -312,10 +361,13 @@ impl Site {
         let text = |key: &str| -> rusqlite::Result<String> {
             db.query_row("select value from meta where key = ?1", [key], |r| r.get(0))
         };
+        let term: i64 = db.query_row("select value from meta where key = 'term'", [], |r| r.get(0))?;
         let manifest = Manifest {
             format: FORMAT,
             root: self.root,
-            site_cert: self.cert.clone(),
+            site_cert: hosts::load_cert(&db)?,
+            term: term as u64,
+            hosts: hosts::load_hosts(&db)?,
             sequence: sequence as u64,
             published: now,
             name: text("name")?,
@@ -402,6 +454,9 @@ impl Site {
     /// poster's I2P destination, when the tunnel says.
     pub fn submit_web(&self, board: &str, content: Content, from: Option<&str>, now: u64) -> Result<Signed<Post>, Fail> {
         content.check()?;
+        if self.role()? == hosts::Role::Standby {
+            return self.forward_web(board, content, from);
+        }
         let db = self.db();
         let web: bool = db
             .query_row("select web from boards where name = ?1", [board], |r| r.get(0))
@@ -475,6 +530,10 @@ impl Site {
 
     /// Closes open epochs that are old enough and seals those whose moderation window is over
     pub fn tick(&self, now: u64) -> Result<(), Fail> {
+        // Only the writer closes and seals; standbys copy what it did
+        if self.role()? == hosts::Role::Standby {
+            return Ok(());
+        }
         let db = self.db();
         let open: Vec<(String, i64, i64)> = db
             .prepare("select board, number, opened from epochs where state = 'open'")?
@@ -747,6 +806,9 @@ fn cbor_response<T: anathemic_core::serde::Serialize>(value: &T) -> Response {
 }
 
 async fn get_manifest(State(site): State<Arc<Site>>) -> Result<Response, Fail> {
+    if site.role()? == hosts::Role::Standby {
+        return Ok(([(header::CONTENT_TYPE, "application/cbor")], site.relayed()?).into_response());
+    }
     Ok(cbor_response(&site.manifest(now())?))
 }
 
@@ -767,7 +829,15 @@ async fn get_posts(State(site): State<Arc<Site>>, UrlPath((board, number)): UrlP
 
 async fn post_submission(State(site): State<Arc<Site>>, UrlPath(board): UrlPath<String>, body: Bytes) -> Result<Response, Fail> {
     let signed: Signed<Submission> = cbor::from_slice(&body)?;
-    Ok(cbor_response(&site.submit(&board, &signed, now())?))
+    tokio::task::spawn_blocking(move || {
+        if site.role()? == hosts::Role::Standby {
+            // Posts reach whichever host answers at the site's address; only the writer takes them
+            return site.forward_submission(&board, &body);
+        }
+        Ok(cbor_response(&site.submit(&board, &signed, now())?))
+    })
+    .await
+    .map_err(|e| Fail::Internal(e.to_string()))?
 }
 
 pub fn router(site: Arc<Site>) -> Router {
@@ -777,6 +847,10 @@ pub fn router(site: Arc<Site>) -> Router {
         .route("/boards/{board}/epochs/{number}/posts", get(get_posts))
         .route("/boards/{board}/epochs/{number}/torrent", get(get_torrent))
         .route("/announce", get(tracker::announce))
+        .route("/mirrors", get(tracker::mirrors))
+        .route("/hosts/state", get(hosts::get_state))
+        .route("/hosts/posts", get(hosts::get_posts))
+        .route("/hosts/web", post(hosts::post_web))
         .route("/boards/{board}/posts", post(post_submission))
         .merge(web::routes())
         .with_state(site)
@@ -791,6 +865,12 @@ pub async fn serve(site: Arc<Site>, listen: SocketAddr, tick: Duration) -> anyho
             interval.tick().await;
             if let Err(fail) = ticker.tick(now()) {
                 eprintln!("closing or sealing epochs failed: {fail:?}");
+            }
+            let hosts = ticker.clone();
+            match tokio::task::spawn_blocking(move || hosts.host_tick(now())).await {
+                Ok(Err(fail)) => eprintln!("keeping up with the site's other hosts failed: {fail:?}"),
+                Err(e) => eprintln!("keeping up with the site's other hosts failed: {e}"),
+                Ok(Ok(())) => {}
             }
         }
     });

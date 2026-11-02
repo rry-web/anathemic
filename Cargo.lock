@@ -67,12 +67,15 @@ version = "0.1.0"
 dependencies = [
  "anathemic-client",
  "anathemic-core",
+ "anathemic-server",
  "anyhow",
  "axum",
  "clap",
  "hex",
  "librqbit",
+ "tempfile",
  "tokio",
+ "ureq",
  "yosemite",
 ]
 
@@ -85,9 +88,11 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "hex",
  "rand 0.8.8",
  "rusqlite",
  "serde",
+ "serde_bytes",
  "sha2",
  "tempfile",
  "tokio",

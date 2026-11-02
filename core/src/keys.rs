@@ -77,6 +77,10 @@ pub enum Context {
     Manifest,
     Submission,
     Post,
+    /// The root key's list of the servers allowed to run a site
+    Hosts,
+    /// A request from one of a site's servers to another
+    HostRequest,
 }
 
 impl Context {
@@ -86,6 +90,8 @@ impl Context {
             Context::Manifest => b"anathemic/1/manifest",
             Context::Submission => b"anathemic/1/submission",
             Context::Post => b"anathemic/1/post",
+            Context::Hosts => b"anathemic/1/hosts",
+            Context::HostRequest => b"anathemic/1/host-request",
         }
     }
 

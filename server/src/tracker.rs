@@ -30,6 +30,8 @@ const EXPIRY: u64 = 2 * INTERVAL + 5 * 60;
 const MAX_REPLY_PEERS: usize = 50;
 /// The most peers remembered for one epoch
 const MAX_SWARM: usize = 2000;
+/// The most mirrors `/mirrors` lists
+const MAX_MIRRORS: usize = 50;
 
 #[derive(Default)]
 pub struct Tracker {
@@ -41,6 +43,8 @@ struct Peer {
     destination: String,
     seen: Time,
     seeding: bool,
+    /// Serves the site read-only over HTTP too, as Anathemic's node does
+    mirror: bool,
 }
 
 /// One announce, as the request's query gives it
@@ -50,6 +54,8 @@ pub struct Announce {
     pub seeding: bool,
     pub compact: bool,
     pub wanted: usize,
+    /// The peer says it serves the site over HTTP; `mirror=1`, Anathemic's own field
+    pub mirror: bool,
 }
 
 impl Tracker {
@@ -61,7 +67,7 @@ impl Tracker {
         if request.stopped {
             swarm.remove(&hash);
         } else if swarm.len() < MAX_SWARM || swarm.contains_key(&hash) {
-            swarm.insert(hash, Peer { destination: destination.to_string(), seen: now, seeding: request.seeding });
+            swarm.insert(hash, Peer { destination: destination.to_string(), seen: now, seeding: request.seeding, mirror: request.mirror });
         }
         let seeders = swarm.values().filter(|peer| peer.seeding).count();
         let leechers = swarm.len() - seeders;
@@ -77,12 +83,29 @@ impl Tracker {
         }
         (peers, seeders, leechers)
     }
+
+    /// The destinations of current mirrors, those seeding the most epochs first
+    pub fn mirrors(&self, now: Time, most: usize) -> Vec<[u8; 32]> {
+        let swarms = self.swarms.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut held: HashMap<[u8; 32], usize> = HashMap::new();
+        for swarm in swarms.values() {
+            for (hash, peer) in swarm {
+                if peer.mirror && peer.seeding && now < peer.seen + EXPIRY {
+                    *held.entry(*hash).or_default() += 1;
+                }
+            }
+        }
+        let mut mirrors: Vec<([u8; 32], usize)> = held.into_iter().collect();
+        mirrors.sort_by_key(|(hash, count)| (std::cmp::Reverse(*count), *hash));
+        mirrors.into_iter().take(most).map(|(hash, _)| hash).collect()
+    }
 }
 
 /// The fields of an announce's query that matter here
 pub fn parse_query(query: &str) -> Result<Announce, &'static str> {
     let mut infohash = None;
-    let mut announce = Announce { infohash: Hash20([0; 20]), stopped: false, seeding: false, compact: false, wanted: MAX_REPLY_PEERS };
+    let mut announce =
+        Announce { infohash: Hash20([0; 20]), stopped: false, seeding: false, compact: false, wanted: MAX_REPLY_PEERS, mirror: false };
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let value = percent_decode(value).ok_or("the query is badly escaped")?;
@@ -92,6 +115,7 @@ pub fn parse_query(query: &str) -> Result<Announce, &'static str> {
             "event" => announce.stopped = text() == "stopped",
             "left" => announce.seeding = text() == "0",
             "compact" => announce.compact = text() == "1",
+            "mirror" => announce.mirror = text() == "1",
             "numwant" => announce.wanted = text().parse().unwrap_or(MAX_REPLY_PEERS),
             _ => {}
         }
@@ -131,6 +155,14 @@ fn reply(value: Value) -> Response {
 /// Trackers answer failures with a reason in the body, not an HTTP error
 fn failure(reason: &str) -> Response {
     reply(Value::dict([("failure reason", reason.into())]))
+}
+
+/// The site's mirrors, one `.b32.i2p` address a line, for clients to fall back on when the
+/// server is down. Any peer learns these from the tracker anyway, so listing them reveals nothing
+/// more.
+pub async fn mirrors(State(site): State<Arc<Site>>) -> Response {
+    let lines: String = site.tracker.mirrors(now(), MAX_MIRRORS).iter().map(|hash| i2p::b32_address(hash) + "\n").collect();
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], lines).into_response()
 }
 
 pub async fn announce(State(site): State<Arc<Site>>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
@@ -188,10 +220,11 @@ mod tests {
     #[test]
     fn swarms() {
         let tracker = Tracker::default();
-        let mut request = Announce { infohash: Hash20([7; 20]), stopped: false, seeding: true, compact: true, wanted: 50 };
+        let mut request = Announce { infohash: Hash20([7; 20]), stopped: false, seeding: true, compact: true, wanted: 50, mirror: true };
         let (peers, seeders, _) = tracker.announce("seed", [1; 32], &request, 100);
         assert!(peers.is_empty());
         assert_eq!(seeders, 1);
+        assert_eq!(tracker.mirrors(100, 10), vec![[1; 32]]);
 
         request.seeding = false;
         let (peers, seeders, leechers) = tracker.announce("leech", [2; 32], &request, 110);

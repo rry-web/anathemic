@@ -26,6 +26,9 @@ struct Cli {
 enum Command {
     /// Show your member key for a site, making one if you have none
     Key { server: String },
+    /// Print a link to pass on, so someone else can read or mirror the site. Anything that
+    /// takes a site's address takes the link too
+    Share { server: String },
     /// List a site's boards
     Boards { server: String },
     /// List a board's threads, or show one thread
@@ -70,8 +73,25 @@ fn main() -> anyhow::Result<()> {
             }
             println!("{} ({})", key.public().to_hex(), key.public().fingerprint());
         }
+        Command::Share { server } => {
+            let client = Client::new(&server, proxy, home)?;
+            let site = client.manifest()?;
+            note_mirror(&client);
+            let link = client.share_link(&site);
+            println!("{link}\n");
+            println!(
+                "It names {}'s root key, so whoever uses it checks everything against that, and {} {}.",
+                site.manifest.title(),
+                link.mirrors.len(),
+                if link.mirrors.len() == 1 { "mirror to fall back on" } else { "mirrors to fall back on" }
+            );
+            println!("To mirror the site: anathemic-node '{link}'");
+            println!("To read it:         anathemic-client read '{link}' <board>");
+        }
         Command::Boards { server } => {
-            let site = Client::new(&server, proxy, home)?.manifest()?;
+            let client = Client::new(&server, proxy, home)?;
+            let site = client.manifest()?;
+            note_mirror(&client);
             let manifest = &site.manifest;
             println!("{} (root key {})", manifest.title(), manifest.root.fingerprint());
             if !manifest.addresses.is_empty() {
@@ -94,6 +114,7 @@ fn main() -> anyhow::Result<()> {
         Command::Read { server, board, thread } => {
             let client = Client::new(&server, proxy, home)?;
             let site = client.manifest()?;
+            note_mirror(&client);
             let posts = client.board_posts(&site, &board)?;
             match thread {
                 Some(thread) => show_thread(&posts, thread)?,
@@ -119,6 +140,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn note_mirror(client: &Client) {
+    if let Some(mirror) = client.source() {
+        eprintln!("{} can't be reached, so this is from {mirror}, one of the site's other hosts or mirrors\n", client.base());
+    }
 }
 
 fn author(post: &Post) -> String {

@@ -7,9 +7,13 @@
 //! ([`tracker_proxy`]), dials a local port for each I2P peer, and is reached through SAM
 //! forwarding ([`sam`]). An allowlist of 127.0.0.1 stops it dialing anything else, even
 //! addresses other peers suggest.
+//!
+//! The same address serves the site read-only over HTTP ([`mirror`]), so clients can read it
+//! while the server is down. The server lists its mirrors, and while the tracker is down, nodes
+//! find each other through that list.
 
-mod sam;
-mod tracker_proxy;
+use anathemic_node::{mirror, sam, tracker_proxy};
+use anathemic_server::snapshot::Mirrored;
 
 use std::{
     collections::HashMap,
@@ -19,8 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anathemic_client::{Client, cache_dir};
-use anathemic_core::{Hash20, SealedRef, epoch::open_bundle, torrent, verify::Verified};
+use anathemic_client::{Client, cache_dir, load_mirrors, posts_path};
+use anathemic_core::{Hash20, PublicKey, SealedRef, epoch::open_bundle, i2p, torrent, verify::Verified};
 use anyhow::Context as _;
 use clap::Parser;
 use librqbit::{
@@ -85,6 +89,11 @@ struct Node {
     client: Arc<Client>,
     rq: Arc<Session>,
     proxy: Arc<tracker_proxy::Proxy>,
+    sam: Arc<sam::Sam>,
+    /// The web pages' copy of the site
+    pages: Arc<Mirrored>,
+    home: PathBuf,
+    root: PublicKey,
     folder: PathBuf,
     /// The epochs being fetched or seeded, by info hash
     held: tokio::sync::Mutex<HashMap<Hash20, (String, ManagedTorrentHandle)>>,
@@ -99,7 +108,16 @@ async fn main() -> anyhow::Result<()> {
     };
     let proxy = (!cli.direct).then_some(cli.proxy.as_str());
     let client = Arc::new(Client::new(&cli.server, proxy, home.clone())?);
-    let site = manifest(&client).await?;
+    // A router that has just started may need minutes to find the site
+    let site = loop {
+        match manifest(&client).await {
+            Ok(site) => break site,
+            Err(e) => {
+                println!("Couldn't fetch the manifest, trying again in 30s: {e:#}");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    };
     let root = site.manifest.root;
 
     // One destination per site, so sites' trackers can't link the nodes that mirror them
@@ -128,11 +146,17 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
-    sam.forward_inbound(rq.listen_addr().context("librqbit isn't listening")?).await?;
+    let pages = Arc::new(Mirrored::new(mirror::snapshot(&home, &root, share_mirrors(&sam.address, &home, &root))?));
+    let http = mirror::serve(folder.clone(), pages.clone()).await?;
+    sam.forward_inbound(rq.listen_addr().context("librqbit isn't listening")?, http).await?;
     println!("Mirroring {} (root key {})", site.manifest.title(), root.fingerprint());
-    println!("This node's I2P address for the site: {}", sam.address);
+    println!("This node's I2P address for the site, where it also serves it read-only: {}", sam.address);
+    println!("Read the mirror in a browser such as rynx at http://{}/", sam.address);
+    if let Some(mirror) = client.source() {
+        println!("The server can't be reached, so reading from {mirror}, one of the site's other hosts or mirrors");
+    }
 
-    let node = Arc::new(Node { cli, client, rq, proxy, folder, held: Default::default() });
+    let node = Arc::new(Node { cli, client, rq, proxy, sam, pages, home, root, folder, held: Default::default() });
     let mut status = tokio::time::interval(Duration::from_secs(node.cli.status_seconds.max(1)));
     let mut check = tokio::time::interval(Duration::from_secs(node.cli.check_seconds.max(1)));
     status.tick().await;
@@ -154,6 +178,12 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// This node, then the other mirrors it knows of, for the share link on its pages
+fn share_mirrors(own: &str, home: &std::path::Path, root: &PublicKey) -> Vec<String> {
+    let others = load_mirrors(home, root).into_iter().map(|m| m.trim_start_matches("http://").to_string());
+    std::iter::once(own.to_string()).chain(others.filter(|m| m != own)).take(4).collect()
+}
+
 async fn manifest(client: &Arc<Client>) -> anyhow::Result<Verified> {
     let client = client.clone();
     tokio::task::spawn_blocking(move || client.manifest()).await?
@@ -172,15 +202,55 @@ impl Node {
         hosts.iter().map(|host| self.proxy.url_for(host)).collect()
     }
 
-    /// Starts seeding or fetching every sealed epoch the node doesn't have in hand yet
+    /// Draws the pages from what the cache holds now
+    fn refresh_pages(&self) {
+        match mirror::snapshot(&self.home, &self.root, share_mirrors(&self.sam.address, &self.home, &self.root)) {
+            Ok(snapshot) => self.pages.replace(snapshot),
+            Err(e) => println!("Couldn't update the mirror's pages: {e:#}"),
+        }
+    }
+
+    /// Bridges to the site's other known mirrors, given to librqbit as peers so nodes find each
+    /// other even while the tracker is down
+    async fn mirror_peers(&self) -> Vec<std::net::SocketAddr> {
+        let mut peers = Vec::new();
+        for mirror in load_mirrors(&self.home, &self.root) {
+            let host = mirror.trim_start_matches("http://");
+            if host == self.sam.address {
+                continue;
+            }
+            if let Some(hash) = i2p::b32_hash(host)
+                && let Ok(addr) = self.sam.bridge(hash).await
+            {
+                peers.push(addr);
+            }
+        }
+        peers
+    }
+
+    /// Keeps the posts of epochs not sealed yet for clients, and starts seeding or fetching
+    /// every sealed epoch the node doesn't have in hand yet
     async fn sync(self: &Arc<Self>, site: &Verified) {
         let trackers = self.trackers(site);
         if trackers.is_empty() {
             println!("The site lists no I2P address, so there's no tracker to find other nodes through");
         }
+        // The mirror list is what keeps things going when the server is down, so keep it current
+        let (client, root) = (self.client.clone(), self.root);
+        let _ = tokio::task::spawn_blocking(move || client.refresh_mirrors(&root, true)).await;
+        let peers = self.mirror_peers().await;
         for board in &site.manifest.boards {
             if !self.cli.boards.is_empty() && !self.cli.boards.contains(&board.name) {
                 continue;
+            }
+            for sealed in &board.sealed {
+                let _ = fs::remove_file(posts_path(&self.home, &self.root, &board.name, sealed.epoch));
+            }
+            let (client, verified, name) = (self.client.clone(), site.clone(), board.name.clone());
+            match tokio::task::spawn_blocking(move || client.unsealed_posts(&verified, &name)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => println!("/{}/: couldn't fetch the posts not sealed yet: {e:#}", board.name),
+                Err(e) => println!("/{}/: {e}", board.name),
             }
             for sealed in &board.sealed {
                 let Some(infohash) = sealed.infohash else { continue };
@@ -188,14 +258,22 @@ impl Node {
                     continue;
                 }
                 let name = torrent::file_name(&board.name, sealed.epoch);
-                if let Err(e) = self.start(&board.name, sealed, infohash, &trackers).await {
+                if let Err(e) = self.start(&board.name, sealed, infohash, &trackers, &peers).await {
                     println!("{name}: {e:#}");
                 }
             }
         }
+        self.refresh_pages();
     }
 
-    async fn start(self: &Arc<Self>, board: &str, sealed: &SealedRef, infohash: Hash20, trackers: &[String]) -> anyhow::Result<()> {
+    async fn start(
+        self: &Arc<Self>,
+        board: &str,
+        sealed: &SealedRef,
+        infohash: Hash20,
+        trackers: &[String],
+        peers: &[std::net::SocketAddr],
+    ) -> anyhow::Result<()> {
         let name = torrent::file_name(board, sealed.epoch);
         let path = self.folder.join(&name);
         if let Ok(bundle) = fs::read(&path)
@@ -216,7 +294,7 @@ impl Node {
                 AddTorrent::from_url(format!("magnet:?xt=urn:btih:{}&dn={name}{tr}", hex::encode(infohash.0)))
             }
         };
-        let handle = self.add(add).await?;
+        let handle = self.add(add, peers.to_vec()).await?;
         println!("{name}: looking for other nodes that have it");
         self.held.lock().await.insert(infohash, (name.clone(), handle.clone()));
 
@@ -251,6 +329,7 @@ impl Node {
                 "{name}: got it from other nodes in {secs:.0}s ({:.0} KB/s); seeding it",
                 bundle.len() as f64 / 1024.0 / secs.max(0.1)
             );
+            self.refresh_pages();
             return Ok(());
         }
 
@@ -264,7 +343,9 @@ impl Node {
         let bundle = tokio::task::spawn_blocking(move || client.fetch_bundle(&b, epoch)).await??;
         open_bundle(&bundle, sealed).context("the server's copy doesn't match the manifest")?;
         fs::write(self.folder.join(&name), &bundle)?;
-        println!("{name}: other nodes sent {got} bytes in {}s, so took the server's copy", patience.as_secs());
+        self.refresh_pages();
+        let source = self.client.source().map_or("the server's".to_string(), |mirror| format!("mirror {mirror}'s"));
+        println!("{name}: other nodes sent {got} bytes in {}s, so took {source} copy", patience.as_secs());
         self.seed(board, sealed, infohash, &bundle, trackers).await
     }
 
@@ -272,14 +353,15 @@ impl Node {
         let name = torrent::file_name(board, sealed.epoch);
         let info = torrent::info(bundle, board, sealed.epoch);
         anyhow::ensure!(torrent::info_hash(&info) == infohash, "the manifest's info hash isn't this epoch's");
-        let handle = self.add(AddTorrent::from_bytes(torrent::file(&info, trackers))).await?;
+        let handle = self.add(AddTorrent::from_bytes(torrent::file(&info, trackers)), Vec::new()).await?;
         self.held.lock().await.insert(infohash, (name.clone(), handle));
         println!("{name}: seeding");
         Ok(())
     }
 
-    async fn add(&self, add: AddTorrent<'_>) -> anyhow::Result<ManagedTorrentHandle> {
+    async fn add(&self, add: AddTorrent<'_>, peers: Vec<std::net::SocketAddr>) -> anyhow::Result<ManagedTorrentHandle> {
         let options = AddTorrentOptions {
+            initial_peers: (!peers.is_empty()).then_some(peers),
             output_folder: Some(self.folder.display().to_string()),
             overwrite: true,
             peer_opts: Some(I2P_PACE),

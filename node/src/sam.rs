@@ -14,7 +14,7 @@ use std::{
 use anathemic_core::i2p;
 use anyhow::Context as _;
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -119,8 +119,10 @@ impl Sam {
         Ok(addr)
     }
 
-    /// Hands every stream other peers open to us to librqbit, listening at `to`
-    pub async fn forward_inbound(self: &Arc<Self>, to: SocketAddr) -> anyhow::Result<()> {
+    /// Hands every stream others open to us to librqbit, listening at `torrents`, or to the
+    /// HTTP mirror at `http`. BitTorrent's handshake starts with the byte 19; HTTP with a
+    /// method name.
+    pub async fn forward_inbound(self: &Arc<Self>, torrents: SocketAddr, http: SocketAddr) -> anyhow::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         self.session.lock().await.forward(port).await.context("asking SAM to forward inbound streams")?;
@@ -139,8 +141,12 @@ impl Sam {
                             .unwrap_or_default();
                         println!("  {} connected to us", short(&address));
                     }
-                    if let Ok(mut to_librqbit) = TcpStream::connect(to).await {
-                        let _ = tokio::io::copy_bidirectional(&mut from_router, &mut to_librqbit).await;
+                    let Ok(first) = from_router.read_u8().await else { return };
+                    let to = if first == 19 { torrents } else { http };
+                    if let Ok(mut local) = TcpStream::connect(to).await
+                        && local.write_all(&[first]).await.is_ok()
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut from_router, &mut local).await;
                     }
                 });
             }
