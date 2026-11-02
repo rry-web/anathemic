@@ -9,6 +9,8 @@ pub type Time = u64;
 pub const FORMAT: u32 = 1;
 pub const MAX_TITLE: usize = 200;
 pub const MAX_BODY: usize = 20_000;
+pub const MAX_SITE_NAME: usize = 100;
+pub const MAX_DESCRIPTION: usize = 2_000;
 
 /// Whether a board's posts show who wrote them
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +47,32 @@ impl Authors {
 pub fn valid_board_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A site's I2P address, as people type it: `<52 characters>.b32.i2p` or a registered name
+/// such as `forum.i2p`
+pub fn valid_address(address: &str) -> bool {
+    let Some(name) = address.strip_suffix(".i2p") else { return false };
+    address.len() <= 255
+        && !name.is_empty()
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// The site's name and description: one line of at most [`MAX_SITE_NAME`] characters, and at
+/// most [`MAX_DESCRIPTION`] characters of post markup
+pub fn check_site_text(name: &str, description: &str) -> Result<(), Error> {
+    if name.contains(['\n', '\r']) || name.chars().count() > MAX_SITE_NAME {
+        return Err(invalid(format!("a site's name is one line of at most {MAX_SITE_NAME} characters")));
+    }
+    if description.chars().count() > MAX_DESCRIPTION {
+        return Err(invalid(format!("a site's description is at most {MAX_DESCRIPTION} characters")));
+    }
+    Ok(())
 }
 
 /// The root key's statement that a site key speaks for the site
@@ -111,6 +139,13 @@ pub struct Post {
     pub content: Content,
     /// The author's signed submission, when the post shows its author
     pub author: Option<Signed<Submission>>,
+    /// Sent from a web page, so no member signed it: the site key is all that vouches for it
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl Post {
@@ -147,6 +182,9 @@ pub struct BoardEntry {
     pub sealed: Vec<SealedRef>,
     /// The epochs after the sealed ones: settling, then the open one last
     pub unsealed: Vec<u64>,
+    /// Whether the site's web pages take anonymous posts from browsers, which no member signs
+    #[serde(default)]
+    pub web_posting: bool,
 }
 
 /// The site's current state; travels signed by the site key
@@ -158,12 +196,26 @@ pub struct Manifest {
     /// Rises with every change; clients never accept a lower one than they've seen
     pub sequence: u64,
     pub published: Time,
+    /// What the operator calls the site; may be empty. The root key is still its identity
+    #[serde(default)]
+    pub name: String,
+    /// Post markup, shown on the site's front page
+    #[serde(default)]
+    pub description: String,
+    /// The I2P addresses the site answers at, the preferred one first
+    #[serde(default)]
+    pub addresses: Vec<String>,
     pub boards: Vec<BoardEntry>,
 }
 
 impl Manifest {
     pub fn board(&self, name: &str) -> Option<&BoardEntry> {
         self.boards.iter().find(|board| board.name == name)
+    }
+
+    /// The site's name, or its root key's fingerprint if it has none
+    pub fn title(&self) -> String {
+        if self.name.trim().is_empty() { format!("Site {}", self.root.fingerprint()) } else { self.name.clone() }
     }
 }
 
@@ -176,4 +228,18 @@ pub struct Epoch {
     /// The previous sealed epoch's hash, chaining the board's history
     pub prev: Option<Hash32>,
     pub posts: Vec<Signed<Post>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses() {
+        assert!(valid_address("forum.i2p"));
+        assert!(valid_address("ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p"));
+        for bad in ["i2p", ".i2p", "forum.com", "Forum.i2p", "a..i2p", "-a.i2p", "http://forum.i2p", "fo rum.i2p"] {
+            assert!(!valid_address(bad), "{bad}");
+        }
+    }
 }

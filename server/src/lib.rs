@@ -11,8 +11,8 @@ use std::{
 };
 
 use anathemic_core::{
-    Authors, BoardEntry, Context, Epoch, FORMAT, Hash32, Manifest, Post, PublicKey, SealedRef,
-    SecretKey, Signed, SiteCert, Submission, Time, cbor, epoch, now, valid_board_name,
+    Authors, BoardEntry, Content, Context, Epoch, FORMAT, Hash32, Manifest, Post, PublicKey, SealedRef,
+    SecretKey, Signed, SiteCert, Submission, Time, cbor, check_site_text, epoch, now, valid_address, valid_board_name,
 };
 use anyhow::{Context as _, bail};
 use axum::{
@@ -35,6 +35,10 @@ const DATABASE: &str = "site.db";
 const CLOCK_SLACK: u64 = 24 * 60 * 60;
 
 pub struct Config {
+    /// Anonymous web posts each board takes in an hour, from everyone together
+    pub web_posts_per_hour: u32,
+    /// …and from each I2P destination, when the tunnel says which one is asking
+    pub web_posts_per_hour_each: u32,
     /// An open epoch closes after this many posts…
     pub epoch_posts: u64,
     /// …or this long after it opened, if it has any posts
@@ -45,7 +49,11 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { epoch_posts: 500, epoch_seconds: 7 * 24 * 60 * 60, window_seconds: 72 * 60 * 60 }
+        Self {
+            web_posts_per_hour: 30,
+            web_posts_per_hour_each: 6,
+            epoch_posts: 500, epoch_seconds: 7 * 24 * 60 * 60, window_seconds: 72 * 60 * 60,
+        }
     }
 }
 
@@ -76,7 +84,76 @@ pub fn init(dir: &Path) -> anyhow::Result<PublicKey> {
     db.execute("insert into meta values('root', ?1)", [root.public().0.to_vec()])?;
     db.execute("insert into meta values('site_cert', ?1)", [cbor::to_vec(&cert)])?;
     db.execute("insert into meta values('sequence', 0)", [])?;
+    migrate(&db)?;
     Ok(root.public())
+}
+
+/// Brings a database made by an older version up to date
+fn migrate(db: &Connection) -> rusqlite::Result<()> {
+    let has_web: i64 =
+        db.query_row("select count(*) from pragma_table_info('boards') where name = 'web'", [], |r| r.get(0))?;
+    if has_web == 0 {
+        db.execute_batch("alter table boards add column web integer not null default 0;")?;
+    }
+    db.execute_batch(
+        "insert or ignore into meta values('name', '');
+         insert or ignore into meta values('description', '');
+         insert or ignore into meta values('addresses', '');
+         create index if not exists posts_by_thread on posts(board, thread, number);",
+    )
+}
+
+/// What `set-site` changes; `None` leaves a field as it is
+#[derive(Default)]
+pub struct SiteSettings {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub addresses: Option<Vec<String>>,
+}
+
+pub fn set_site(dir: &Path, settings: SiteSettings) -> anyhow::Result<()> {
+    let db = open_db(dir)?;
+    let text = |key: &str| -> rusqlite::Result<String> {
+        db.query_row("select value from meta where key = ?1", [key], |r| r.get(0))
+    };
+    let name = settings.name.map_or_else(|| text("name"), Ok)?;
+    let description = settings.description.map_or_else(|| text("description"), Ok)?;
+    check_site_text(&name, &description)?;
+    if let Some(addresses) = &settings.addresses {
+        if let Some(bad) = addresses.iter().find(|a| !valid_address(a)) {
+            bail!("{bad:?} isn't an I2P address, like forum.i2p or <52 characters>.b32.i2p");
+        }
+        db.execute("update meta set value = ?1 where key = 'addresses'", [addresses.join("\n")])?;
+    }
+    db.execute("update meta set value = ?1 where key = 'name'", [name.trim()])?;
+    db.execute("update meta set value = ?1 where key = 'description'", [description])?;
+    bump(&db)?;
+    Ok(())
+}
+
+/// Turns anonymous posting from the web pages on or off for a board
+pub fn set_web_posting(dir: &Path, board: &str, on: bool) -> anyhow::Result<()> {
+    let db = open_db(dir)?;
+    let authors: Option<String> =
+        db.query_row("select authors from boards where name = ?1", [board], |r| r.get(0)).optional()?;
+    match authors.as_deref() {
+        None => bail!("there's no board /{board}/"),
+        Some("shown") if on => bail!("/{board}/ shows every post's author, so it can't take anonymous web posts"),
+        _ => {}
+    }
+    db.execute("update boards set web = ?2 where name = ?1", params![board, on])?;
+    bump(&db)?;
+    Ok(())
+}
+
+fn open_db(dir: &Path) -> anyhow::Result<Connection> {
+    let path = dir.join(DATABASE);
+    if !path.exists() {
+        bail!("{} holds no site; run init first", dir.display());
+    }
+    let db = Connection::open(path)?;
+    migrate(&db)?;
+    Ok(db)
 }
 
 pub fn add_board(dir: &Path, name: &str, title: &str, authors: Authors) -> anyhow::Result<()> {
@@ -86,10 +163,10 @@ pub fn add_board(dir: &Path, name: &str, title: &str, authors: Authors) -> anyho
     if web::RESERVED.contains(&name) {
         bail!("/{name}/ is one of the server's own addresses");
     }
-    let db = Connection::open(dir.join(DATABASE))?;
+    let db = open_db(dir)?;
     let position: i64 = db.query_row("select count(*) from boards", [], |r| r.get(0))?;
     db.execute(
-        "insert into boards values(?1, ?2, ?3, 0, ?4)",
+        "insert into boards(name, title, authors, tier, position) values(?1, ?2, ?3, 0, ?4)",
         params![name, title, authors.name(), position],
     )
     .with_context(|| format!("adding board {name}"))?;
@@ -151,13 +228,14 @@ pub struct Site {
     root: PublicKey,
     cert: Signed<SiteCert>,
     config: Config,
+    /// When recent web posts were made, by board and by board and destination
+    web_posts: Mutex<HashMap<String, Vec<Time>>>,
 }
 
 impl Site {
     pub fn open(dir: &Path, config: Config) -> anyhow::Result<Site> {
         let key = SecretKey::from_bytes(&fs::read(dir.join(SITE_KEY))?)?;
-        let db = Connection::open(dir.join(DATABASE))?;
-        db.execute_batch("create index if not exists posts_by_thread on posts(board, thread, number);")?;
+        let db = open_db(dir)?;
         let meta = |name: &str| -> anyhow::Result<Vec<u8>> {
             Ok(db.query_row("select value from meta where key = ?1", [name], |r| r.get(0))?)
         };
@@ -166,7 +244,7 @@ impl Site {
         if cert.open(Context::SiteCert, Some(&root))?.site_key != key.public() {
             bail!("{SITE_KEY} isn't the key the root key certified");
         }
-        Ok(Site { db: Mutex::new(db), key, root, cert, config })
+        Ok(Site { db: Mutex::new(db), key, root, cert, config, web_posts: Mutex::new(HashMap::new()) })
     }
 
     pub fn root(&self) -> PublicKey {
@@ -181,12 +259,12 @@ impl Site {
         let db = self.db();
         let sequence: i64 = db.query_row("select value from meta where key = 'sequence'", [], |r| r.get(0))?;
         let mut boards = Vec::new();
-        let mut statement = db.prepare("select name, title, authors, tier from boards order by position")?;
+        let mut statement = db.prepare("select name, title, authors, tier, web from boards order by position")?;
         let rows = statement.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u8>(3)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u8>(3)?, r.get::<_, bool>(4)?))
         })?;
         for row in rows {
-            let (name, title, authors, tier) = row?;
+            let (name, title, authors, tier, web_posting) = row?;
             let mut sealed = Vec::new();
             let mut unsealed = Vec::new();
             let mut epochs = db.prepare(
@@ -204,14 +282,20 @@ impl Site {
                 }
             }
             let authors = Authors::parse(&authors).ok_or_else(|| Fail::Internal(format!("bad authors {authors}")))?;
-            boards.push(BoardEntry { name, title, authors, tier, sealed, unsealed });
+            boards.push(BoardEntry { name, title, authors, tier, sealed, unsealed, web_posting });
         }
+        let text = |key: &str| -> rusqlite::Result<String> {
+            db.query_row("select value from meta where key = ?1", [key], |r| r.get(0))
+        };
         let manifest = Manifest {
             format: FORMAT,
             root: self.root,
             site_cert: self.cert.clone(),
             sequence: sequence as u64,
             published: now,
+            name: text("name")?,
+            description: text("description")?,
+            addresses: text("addresses")?.lines().map(str::to_string).collect(),
             boards,
         };
         Ok(self.key.sign(Context::Manifest, &manifest))
@@ -264,22 +348,64 @@ impl Site {
             (Some(Authors::Choice), anonymous) => !anonymous,
             _ => false,
         };
-        if let Some(thread) = submission.content.thread {
-            let starts: i64 = db.query_row(
-                "select count(*) from posts where board = ?1 and number = ?2 and thread is null",
-                params![board, thread as i64],
-                |r| r.get(0),
-            )?;
-            if starts == 0 {
-                return refuse("there's no such thread");
-            }
-        }
+        check_thread(&db, board, &submission.content)?;
         let fingerprint = Sha256::digest(&signed.body).to_vec();
         let seen: i64 = db.query_row("select count(*) from posts where submission = ?1", [&fingerprint], |r| r.get(0))?;
         if seen > 0 {
             return refuse("this post was already made");
         }
 
+        self.insert_post(&db, board, submission.content, shown.then(|| signed.clone()), &signed.signer.0, fingerprint, now)
+    }
+
+    /// Takes an anonymous post from the web pages, on boards that allow them. `from` is the
+    /// poster's I2P destination, when the tunnel says.
+    pub fn submit_web(&self, board: &str, content: Content, from: Option<&str>, now: u64) -> Result<Signed<Post>, Fail> {
+        content.check()?;
+        let db = self.db();
+        let web: bool = db
+            .query_row("select web from boards where name = ?1", [board], |r| r.get(0))
+            .optional()?
+            .ok_or(Fail::NotFound)?;
+        if !web {
+            return refuse("this board takes posts only from the anathemic client");
+        }
+        check_thread(&db, board, &content)?;
+        {
+            let mut recent = self.web_posts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            recent.retain(|_, times| {
+                times.retain(|&t| now < t + 3600);
+                !times.is_empty()
+            });
+            let everyone = recent.get(board).map_or(0, Vec::len);
+            let each_key = from.map(|from| format!("{board} {from}"));
+            let each = each_key.as_ref().and_then(|key| recent.get(key)).map_or(0, Vec::len);
+            if everyone >= self.config.web_posts_per_hour as usize || each >= self.config.web_posts_per_hour_each as usize {
+                return refuse("this board has taken all the web posts it takes in an hour; try again later");
+            }
+            recent.entry(board.to_string()).or_default().push(now);
+            if let Some(key) = each_key {
+                recent.entry(key).or_default().push(now);
+            }
+        }
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        self.insert_post(&db, board, content, None, &[], nonce.to_vec(), now)
+    }
+
+    /// Numbers, signs and stores a post, closing its epoch if that fills it
+    #[allow(clippy::too_many_arguments)]
+    fn insert_post(
+        &self,
+        db: &Connection,
+        board: &str,
+        content: Content,
+        author: Option<Signed<Submission>>,
+        author_key: &[u8],
+        fingerprint: Vec<u8>,
+        now: u64,
+    ) -> Result<Signed<Post>, Fail> {
+        let web = author_key.is_empty();
         let number: i64 = db.query_row("select coalesce(max(number), 0) + 1 from posts where board = ?1", [board], |r| r.get(0))?;
         let epoch: i64 = db.query_row("select number from epochs where board = ?1 and state = 'open'", [board], |r| r.get(0))?;
         let post = Post {
@@ -287,21 +413,14 @@ impl Site {
             number: number as u64,
             epoch: epoch as u64,
             accepted: now,
-            content: submission.content,
-            author: shown.then(|| signed.clone()),
+            content,
+            author,
+            web,
         };
         let record = self.key.sign(Context::Post, &post);
         db.execute(
             "insert into posts values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                board,
-                number,
-                epoch,
-                post.content.thread.map(|t| t as i64),
-                cbor::to_vec(&record),
-                signed.signer.0.to_vec(),
-                fingerprint
-            ],
+            params![board, number, epoch, post.content.thread.map(|t| t as i64), cbor::to_vec(&record), author_key, fingerprint],
         )?;
         let count: i64 = db.query_row(
             "select count(*) from posts where board = ?1 and epoch = ?2",
@@ -309,7 +428,7 @@ impl Site {
             |r| r.get(0),
         )?;
         if count as u64 >= self.config.epoch_posts {
-            close_epoch(&db, board, epoch, now)?;
+            close_epoch(db, board, epoch, now)?;
         }
         Ok(record)
     }
@@ -392,14 +511,25 @@ impl Site {
             .collect()
     }
 
-    /// A board's title and author rule
-    pub fn board(&self, board: &str) -> Result<(String, Authors), Fail> {
-        let (title, authors): (String, String) = self
+    /// A board's title, author rule, and whether it takes web posts
+    pub fn board(&self, board: &str) -> Result<(String, Authors, bool), Fail> {
+        let (title, authors, web): (String, String, bool) = self
             .db()
-            .query_row("select title, authors from boards where name = ?1", [board], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("select title, authors, web from boards where name = ?1", [board], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .optional()?
             .ok_or(Fail::NotFound)?;
-        Ok((title, parse_authors(&authors)?))
+        Ok((title, parse_authors(&authors)?, web))
+    }
+
+    /// The site's name, description and addresses, as the manifest gives them
+    pub fn about(&self) -> Result<(String, String, Vec<String>), Fail> {
+        let db = self.db();
+        let text = |key: &str| -> rusqlite::Result<String> {
+            db.query_row("select value from meta where key = ?1", [key], |r| r.get(0))
+        };
+        Ok((text("name")?, text("description")?, text("addresses")?.lines().map(str::to_string).collect()))
     }
 
     /// A page of a board's threads, the most recently active first, and how many there are
@@ -479,6 +609,21 @@ impl Site {
             })
             .collect())
     }
+}
+
+/// A reply's thread exists
+fn check_thread(db: &Connection, board: &str, content: &Content) -> Result<(), Fail> {
+    if let Some(thread) = content.thread {
+        let starts: i64 = db.query_row(
+            "select count(*) from posts where board = ?1 and number = ?2 and thread is null",
+            params![board, thread as i64],
+            |r| r.get(0),
+        )?;
+        if starts == 0 {
+            return refuse("there's no such thread");
+        }
+    }
+    Ok(())
 }
 
 fn parse_authors(name: &str) -> Result<Authors, Fail> {

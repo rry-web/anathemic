@@ -51,6 +51,9 @@ pub fn check_post(
         return Err(invalid(format!("post {} is filed in the wrong place", post.number)));
     }
     post.content.check()?;
+    if post.web && post.author.is_some() {
+        return Err(invalid(format!("post {} came from the web but names an author", post.number)));
+    }
     if let Some(author) = &post.author {
         let submission = author.open(Context::Submission, None)?;
         if submission.board != board || submission.content != post.content {
@@ -115,6 +118,7 @@ mod tests {
             accepted: 0,
             content,
             author: Some(author.sign(Context::Submission, &submission)),
+            web: false,
         };
         site.sign(Context::Post, &post)
     }

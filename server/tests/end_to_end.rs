@@ -5,9 +5,10 @@ use std::{fs, sync::Arc};
 
 use anathemic_client::Client;
 use anathemic_core::{Authors, Content, SecretKey, now};
-use anathemic_server::{Config, Site, add_board, init, router};
+use anathemic_server::{Config, Site, SiteSettings, add_board, init, router, set_site, set_web_posting};
 
 struct Running {
+    dir: std::path::PathBuf,
     site: Arc<Site>,
     url: String,
     _runtime: tokio::runtime::Runtime,
@@ -18,14 +19,14 @@ fn start(dir: &std::path::Path) -> Running {
     add_board(dir, "general", "General", Authors::Choice).unwrap();
     add_board(dir, "named", "Names shown", Authors::Shown).unwrap();
     add_board(dir, "masks", "Names hidden", Authors::Hidden).unwrap();
-    let config = Config { epoch_posts: 3, epoch_seconds: 3600, window_seconds: 60 };
+    let config = Config { epoch_posts: 3, epoch_seconds: 3600, window_seconds: 60, web_posts_per_hour: 5, web_posts_per_hour_each: 2 };
     let site = Arc::new(Site::open(dir, config).unwrap());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = router(site.clone());
     runtime.spawn(async move { axum_serve(listener, app).await });
-    Running { site, url, _runtime: runtime }
+    Running { dir: dir.to_path_buf(), site, url, _runtime: runtime }
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) {
@@ -197,4 +198,106 @@ fn reserved_board_names_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     init(dir.path()).unwrap();
     assert!(add_board(dir.path(), "manifest", "Clash", Authors::Choice).is_err());
+}
+
+/// Posts a web form; the status and where it sent the browser, or the page
+fn post_form(url: &str, fields: &[(&str, &str)], from: Option<&str>) -> (u16, String) {
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let mut request = agent.post(url);
+    if let Some(from) = from {
+        request = request.set("X-I2P-DestHash", from);
+    }
+    let response = match request.send_form(fields) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(e) => panic!("{e}"),
+    };
+    let status = response.status();
+    let location = response.header("location").map(str::to_string);
+    (status, if status == 303 { location.unwrap() } else { response.into_string().unwrap() })
+}
+
+#[test]
+fn boards_can_take_anonymous_posts_from_the_web() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("site"));
+    let client = Client::new(&server.url, None, dir.path().join("home")).unwrap();
+    let board = format!("{}/general/", server.url);
+
+    // Off until the operator turns it on
+    assert!(!get_page(&board).1.contains("<form"));
+    let (status, page) = post_form(&board, &[("title", "Hi"), ("body", "from rynx")], None);
+    assert_eq!(status, 400);
+    assert!(page.contains("only from the anathemic client"), "{page}");
+
+    assert!(set_web_posting(&server.dir, "named", true).is_err());
+    set_web_posting(&server.dir, "general", true).unwrap();
+    assert!(client.manifest().unwrap().manifest.board("general").unwrap().web_posting);
+    assert!(get_page(&board).1.contains("<form method=\"post\" action=\"/general/\">"));
+
+    assert_eq!(post_form(&board, &[("title", "From a browser"), ("body", "line one\r\nline two")], Some("aaa")).1, "/general/1#p1");
+    assert_eq!(post_form(&format!("{board}1"), &[("body", "a reply")], Some("aaa")).1, "/general/1#p2");
+
+    // The client verifies them like any other post
+    let site = client.manifest().unwrap();
+    let posts = client.board_posts(&site, "general").unwrap();
+    assert_eq!(posts.len(), 2);
+    assert!(posts.iter().all(|post| post.web && post.author_key().is_none()));
+    assert_eq!(posts[0].content.body, "line one\nline two");
+    assert!(get_page(&format!("{board}1")).1.contains("Anonymous (web)"));
+
+    // Refused posts come back with the reason and what was typed
+    let (status, page) = post_form(&board, &[("title", ""), ("body", "kept <text>")], Some("bbb"));
+    assert_eq!(status, 400);
+    assert!(page.contains("a title is one line of text") && page.contains("kept &lt;text&gt;</textarea>"), "{page}");
+
+    // Two an hour from each destination, five from everyone
+    let (status, page) = post_form(&format!("{board}1"), &[("body", "third")], Some("aaa"));
+    assert_eq!(status, 400);
+    assert!(page.contains("try again later"), "{page}");
+    for i in 0..3 {
+        assert_eq!(post_form(&format!("{board}1"), &[("body", &format!("other {i}"))], None).0, 303);
+    }
+    assert_eq!(post_form(&format!("{board}1"), &[("body", "one too many")], Some("ccc")).0, 400);
+}
+
+#[test]
+fn the_site_has_a_name_description_and_addresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("site"));
+    let client = Client::new(&server.url, None, dir.path().join("home")).unwrap();
+    let before = client.manifest().unwrap().manifest;
+    assert_eq!(before.title(), format!("Site {}", server.site.root().fingerprint()));
+
+    let bad = SiteSettings { addresses: Some(vec!["forum.com".into()]), ..Default::default() };
+    assert!(set_site(&server.dir, bad).is_err());
+    set_site(
+        &server.dir,
+        SiteSettings {
+            name: Some("The <Forum>".into()),
+            description: Some("Talk about **anything**.".into()),
+            addresses: Some(vec!["forum.i2p".into()]),
+        },
+    )
+    .unwrap();
+    let after = client.manifest().unwrap().manifest;
+    assert!(after.sequence > before.sequence);
+    assert_eq!((after.name.as_str(), after.addresses.as_slice()), ("The <Forum>", &["forum.i2p".to_string()][..]));
+
+    let index = get_page(&server.url).1;
+    assert!(index.contains("<h1>The &lt;Forum&gt;</h1>"), "{index}");
+    assert!(index.contains("Talk about <strong>anything</strong>."), "{index}");
+    assert!(get_page(&format!("{}/general/", server.url)).1.contains("anathemic-client post http://forum.i2p general"));
+}
+
+#[test]
+fn sites_made_by_the_first_prototype_still_open() {
+    let dir = tempfile::tempdir().unwrap();
+    init(dir.path()).unwrap();
+    add_board(dir.path(), "general", "General", Authors::Choice).unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("site.db")).unwrap();
+    db.execute_batch("alter table boards drop column web; delete from meta where key in ('name', 'description', 'addresses');").unwrap();
+    drop(db);
+    let site = Site::open(dir.path(), Config::default()).unwrap();
+    assert!(!site.manifest(now()).unwrap().peek().unwrap().boards[0].web_posting);
 }

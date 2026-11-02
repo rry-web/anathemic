@@ -1,4 +1,4 @@
-use crate::{Context, Error, Manifest, PublicKey, Signed, invalid, valid_board_name};
+use crate::{Context, Error, Manifest, PublicKey, Signed, check_site_text, invalid, valid_address, valid_board_name};
 
 /// A manifest whose signatures check out, with the site key it vouches for
 #[derive(Clone, Debug)]
@@ -20,6 +20,10 @@ pub fn manifest(signed: &Signed<Manifest>, pinned: Option<&PublicKey>) -> Result
     }
     let cert = claimed.site_cert.open(Context::SiteCert, Some(&claimed.root))?;
     let manifest = signed.open(Context::Manifest, Some(&cert.site_key))?;
+    check_site_text(&manifest.name, &manifest.description)?;
+    if let Some(address) = manifest.addresses.iter().find(|a| !valid_address(a)) {
+        return Err(invalid(format!("{address:?} isn't an I2P address")));
+    }
     for board in &manifest.boards {
         if !valid_board_name(&board.name) {
             return Err(invalid(format!("board name {:?} isn't allowed", board.name)));
@@ -47,6 +51,9 @@ mod tests {
             site_cert: cert,
             sequence: 1,
             published: 0,
+            name: String::new(),
+            description: String::new(),
+            addresses: vec![],
             boards: vec![],
         };
         site.sign(Context::Manifest, &manifest)
@@ -67,5 +74,16 @@ mod tests {
         stolen.sequence = 99;
         let resigned = impostor.sign(Context::Manifest, &stolen);
         assert!(manifest(&resigned, None).is_err());
+    }
+
+    #[test]
+    fn addresses_must_be_i2p() {
+        let root = SecretKey::generate();
+        let site = SecretKey::generate();
+        let mut fields = signed(&root, &site).peek().unwrap();
+        fields.addresses = vec!["forum.i2p".into(), "example.com".into()];
+        assert!(manifest(&site.sign(Context::Manifest, &fields), None).is_err());
+        fields.addresses.pop();
+        assert!(manifest(&site.sign(Context::Manifest, &fields), None).is_ok());
     }
 }

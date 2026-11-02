@@ -72,13 +72,21 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Boards { server } => {
             let site = Client::new(&server, proxy, home)?.manifest()?;
-            println!("Site {}", site.manifest.root.fingerprint());
-            for board in &site.manifest.boards {
+            let manifest = &site.manifest;
+            println!("{} (root key {})", manifest.title(), manifest.root.fingerprint());
+            if !manifest.addresses.is_empty() {
+                println!("At {}", manifest.addresses.join(", "));
+            }
+            if !manifest.description.trim().is_empty() {
+                println!("\n{}\n", manifest.description.trim_end());
+            }
+            for board in &manifest.boards {
                 println!(
-                    "/{}/  {}  (authors {}, {} sealed epochs)",
+                    "/{}/  {}  (authors {}{}, {} sealed epochs)",
                     board.name,
                     board.title,
                     board.authors.name(),
+                    if board.web_posting { ", anonymous web posts" } else { "" },
                     board.sealed.len()
                 );
             }
@@ -114,7 +122,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn author(post: &Post) -> String {
-    post.author_key().map_or_else(|| "Anonymous".to_string(), |key| key.fingerprint())
+    match post.author_key() {
+        Some(key) => key.fingerprint(),
+        None if post.web => "Anonymous (web)".to_string(),
+        None => "Anonymous".to_string(),
+    }
 }
 
 fn list_threads(posts: &[Post]) {

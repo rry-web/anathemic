@@ -54,6 +54,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "rand",
  "rusqlite",
  "serde",
  "sha2",

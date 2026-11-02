@@ -25,9 +25,13 @@ Settled before the prototype (2026-11-02):
 | Code layout | A Rust workspace: `anathemic-core` (formats, signatures, verification), `anathemic-server`, `anathemic-client` (command line first) and later `anathemic-node` (seeding). The server keeps its state in SQLite |
 | JavaScript | None, anywhere. Any web pages are HTML and CSS rendered by the server, so rynx and other text browsers can read them |
 
-No JavaScript means a plain browser can't solve a proof-of-work puzzle when posting. Posting
-from a browser therefore works only on boards where the operator turns the puzzle off.
-Everywhere else, posting needs the dedicated client, which solves the puzzle itself.
+Browsers have no member key, so posts from the web pages are anonymous: only the site key
+signs them, and they're marked as web posts. They're accepted only on boards where the operator
+turns web posting on (never on boards that always show authors), and are rate limited per board
+and per I2P destination (the i2pd tunnel's `X-I2P-DestHash` header). No JavaScript means most
+browsers can't solve a proof-of-work puzzle; rynx can (it already solves ALTCHA's), so a puzzle
+on web posting stays possible. Posting with a member key needs the dedicated client, or later
+rynx itself.
 
 ## Goals
 
@@ -86,7 +90,8 @@ Every signature is ed25519.
   that node does then counts toward the member's quota, so someone on a phone or on the glasses
   can seed from home.
 
-The site's address is its I2P destination. The root key's fingerprint is its permanent
+The site's address is its I2P destination: its `.b32.i2p` address, or a registered name. The
+operator lists them in the manifest, with a name and description for the site. The root key's fingerprint is its permanent
 identity: clients pin it on first visit, like SSH host keys. A manifest signed by any other root
 key is a different site.
 
@@ -149,6 +154,7 @@ The manifest is the site's signed, current head. It is small and fetched often:
 ```
 {
   site: root fingerprint, site-key certificate,
+  name, description, addresses: ["forum.i2p", "<…>.b32.i2p"],
   sequence: 1042,                       // monotonically increasing; highest valid wins
   boards: [{ name, tier, rules-hash,
              sealed: [ { epoch, sha256, size, infohash } … ],

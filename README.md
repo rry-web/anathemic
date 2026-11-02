@@ -16,9 +16,11 @@ core:
   authors, hide them, or let posters choose.
 - **Web pages** for reading a site in rynx or any other browser: the boards, each board's threads
   and each thread, in plain HTML with no JavaScript. The server draws them from its own records,
-  so unlike the client they don't check signatures.
+  so unlike the client they don't check signatures. Boards can also take anonymous posts from
+  these pages, if the operator turns it on. No member signs those posts, so they're rate limited
+  instead.
 
-Not yet: posting from a browser, mirroring between members, moderation, media, tags, a full
+Not yet: mirroring between members, moderation, media, tags, a full
 client UI.
 
 ## Trying it
@@ -26,9 +28,9 @@ client UI.
 ```sh
 cargo build --release
 
-# A site, with one board where posters choose whether to show their key
-target/release/anathemic-server --data mysite init
-target/release/anathemic-server --data mysite add-board general --title "General" --authors choice
+# A site, with one board where posters choose whether to show their key and browsers can post
+target/release/anathemic-server --data mysite init --name "My Site"
+target/release/anathemic-server --data mysite add-board general --title "General" --authors choice --web-posting
 target/release/anathemic-server --data mysite serve      # on 127.0.0.1:8470
 
 # On this computer, without I2P
@@ -42,6 +44,11 @@ Then open `http://127.0.0.1:8470/` in rynx (or any browser) to read the site.
 
 For quick tests, `serve --epoch-posts 2 --window-seconds 10 --tick-seconds 1` seals epochs
 within seconds. By default epochs close at 500 posts or 7 days, and seal 72 hours later.
+
+`set-site` changes the site's name, its description (post markup, shown on the front page) and
+the I2P addresses it answers at; `set-board general --web-posting off` stops browser posts. Both
+work while the server runs. Web posts are limited to 30 an hour per board, and 6 from each I2P
+destination (`serve --web-posts-per-hour`, `--web-posts-per-hour-each`).
 
 `init` writes `root.key`, the site's identity. `serve` never reads it, so keep a copy offline.
 
@@ -64,7 +71,16 @@ Clients reach it through the router's HTTP proxy, which they use by default
 anathemic-client read http://<the tunnel's address>.b32.i2p general
 ```
 
-rynx reads the same address through the router, in I2P mode.
+The site's address is that tunnel's `.b32.i2p` address (the router console lists it under
+server tunnels), or a name such as `mysite.i2p` once registered with an address book such as
+reg.i2p or stats.i2p. Put it in the manifest so clients and pages show it:
+
+```sh
+anathemic-server --data mysite set-site --address mysite.i2p --address <the tunnel's address>.b32.i2p
+```
+
+The web pages make the site an ordinary eepsite: rynx reads the same address through the router,
+in I2P mode, and can post on boards with web posting on.
 
 ## License
 
