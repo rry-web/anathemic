@@ -1,0 +1,13 @@
+[package]
+name = "rqtest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+data-encoding = "2.11.1"
+librqbit = "9"
+sha1_smol = "1.0.1"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+yosemite = "0.7"

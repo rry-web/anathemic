@@ -207,8 +207,10 @@ seeders may receive copyright complaints.
   images at once reveals only "this peer reads this board", not which post it opened.
 - **Tier 2 media** are shared as clearnet torrents, also one per epoch, fetched after a random
   delay (see [Leaks](#leaks-and-how-the-design-closes-them)).
-- **Mirrors** announce what they hold through the I2P DHT and trackers. No index of who mirrors
-  what is kept centrally.
+- **Mirrors** announce what they hold to the site's tracker, which the operator's server runs
+  inside I2P (libtorrent has no I2P DHT yet, and public I2P trackers proved unreliable), and to
+  trackers that mirrors run, for when the server is down. The tracker knows which destinations
+  hold which epochs, but not who is behind them.
 
 ## Posting media
 
@@ -371,7 +373,7 @@ apply the log entries that came after them.
 | Need | Candidate | Notes |
 |---|---|---|
 | I2P router | i2pd, through SAM v3 | emissary (Rust) later, once mature |
-| I2P torrents | SAM-capable BitTorrent; I2PSnark's network | Which Rust library supports SAM needs checking |
+| I2P torrents | librqbit with a SAM bridge (`yosemite`); the server as tracker | Tested 2026-11-02 against libtorrent, see [experiments/i2p-torrents](experiments/i2p-torrents/README.md). Standard v1 torrents, so qBittorrent and I2PSnark can seed too |
 | Clearnet torrents | a Rust BitTorrent library (librqbit?) | Need to check its BitTorrent v2 and BEP 46 support; per-file SHA-256 means v2 isn't required |
 | Signatures | ed25519 (ed25519-dalek) | |
 | Serialisation | CBOR, deterministic encoding | |
@@ -461,7 +463,8 @@ mirrored epochs.
 1. **Text core:** the server accepts signed posts over I2P, seals epochs and publishes a signed
    manifest. A command-line client fetches and verifies the manifest and epochs, and posts.
 2. **Mirroring:** sealed epochs shared over I2P torrents; the client fetches from mirrors when
-   the server is down; manifests relayed.
+   the server is down; manifests relayed. The server runs the I2P tracker, and nodes use
+   librqbit through a SAM bridge (chosen by the tests in `experiments/i2p-torrents`).
 3. **Moderation:** moderator certificates, the revocation list, bans, the moderation window.
 4. **Tier 1 media:** the upload pipeline, I2P media torrents, the seeding quota and challenges.
 5. **Tier 2 media:** seedboxes, clearnet torrents, the delays and notices.
