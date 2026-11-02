@@ -16,6 +16,9 @@ them and a link to an old post keeps working even when the operator's server is 
   only on boards the operator marks that way, and a user's client can always be stricter.
 - **Accountable moderation:** one operator, moderators the operator appoints, and revocation that
   every honest client applies.
+- **Policy belongs to the operator:** Anathemic provides moderation tools, not rules. What is
+  allowed, how strictly it is enforced and which of the measures below are switched on are each
+  site's choice.
 - **Spam resistance once LLMs make text cheap:** posting costs something a bot farm can't fake
   cheaply, and part of that cost goes into hosting the site.
 - **Off-the-shelf parts:** i2pd, BitTorrent, ed25519 and existing formats wherever they fit.
@@ -26,6 +29,8 @@ them and a link to an old post keeps working even when the operator's server is 
 
 - Multi-writer or serverless forums. The operator's server is the only writer, and mirrors only
   copy what it signed.
+- Content rules built into the software or protocol. Anathemic doesn't decide what a site
+  allows; its operator does.
 - Censorship that nobody can undo. Revocation is deliberately part of the design (see
   [Moderation](#moderation-and-revocation)).
 - Anonymity on the clearnet tier. That tier gives faster media, not privacy.
@@ -80,7 +85,7 @@ An epoch passes through three states:
 
 1. **Open:** new posts arrive. Only the server holds it, and clients fetch it from the server.
 2. **Settling:** closed to new posts, but moderators can still remove posts. This is the
-   moderation window (suggested: 72 hours). Sealing spam immediately would mirror it forever.
+   moderation window (the operator sets it per board; suggested default: 72 hours). Sealing spam immediately would mirror it forever.
 3. **Sealed:** serialised deterministically, compressed, hashed and signed. The epoch is then
    immutable, and any mirror can serve it.
 
@@ -168,8 +173,8 @@ seeders may receive copyright complaints.
    1 size if the board is tier 1.
 2. It uploads the file to the server over I2P with the post.
 3. The server strips and re-encodes again (never trust the client), then checks the file against
-   perceptual-hash blocklists. On tier 1 image boards, new members' uploads go to a moderator
-   for approval first.
+   any perceptual-hash blocklists the site uses. If the operator turns on an approval queue,
+   uploads (from everyone, or only from new members) wait for a moderator.
 4. When the post is accepted, the operator's seedboxes (for tier 2) or the server (for tier 1)
    start seeding.
 5. The poster's client **never seeds its own fresh upload on the clearnet**. On tier 2 it may
@@ -194,6 +199,11 @@ Posting requires seeding. This makes members host the site, and makes spam cost 
   [Spam](#spam-in-the-llm-era).
 
 ## Moderation and revocation
+
+The operator decides each site's policy: its rules, how moderators enforce them, and which of
+the tools here and in [Spam](#spam-in-the-llm-era) are switched on. Anathemic supplies the
+tools, with defaults a new site can start from. Clients apply a site's revocations, so
+whatever an operator removes is removed from that site's mirrors too.
 
 - **The revocation list** is append-only and signed by the site key. Moderators' entries are
   countersigned by the server. Each entry is `{target, kind, scope, reason code, moderator,
@@ -273,8 +283,8 @@ members and gardeners, rather than every viewer trusting different taggers.
 
 - **Namespaces:** `creator:`, `series:`, `character:`, `meta:` (such as `animated`, `translated`,
   `low_res`) and general tags with no prefix.
-- **Rating, required on every media post:** `rating:safe`, `rating:questionable` or
-  `rating:explicit`. A post can't be accepted without one, and moderators can correct it.
+- **Rating:** `rating:safe`, `rating:questionable` or `rating:explicit`. The operator chooses
+  whether every media post must carry one (the default) and which ratings each board accepts.
 - **Aliases:** `cat_girl` → `catgirl`. Searching or tagging with an alias uses the canonical tag.
 - **Implications:** `kitten` → `cat` → `animal`. Adding a tag adds what it implies.
 - **Wiki pages:** each tag can have a page saying what it means and when to use it. Those pages
@@ -308,7 +318,8 @@ apply the log entries that came after them.
   million posts with 20 tags each should compress to tens of MB.
 - **Booru query syntax:** `cat -dog rating:safe creator:someone order:new`.
 - **Blacklists** are kept by each client: posts with blacklisted tags are hidden, and their
-  media is not fetched. `rating:explicit` is on the default blacklist.
+  media is not fetched. The operator can suggest a default blacklist for new members (such as
+  `rating:explicit`), and each member can change it.
 - **Overlays (later):** other people's tag sets, published as signed label events (in the style
   of Nostr's NIP-32), can be layered over the canonical set, filtered by whom the user trusts.
 
@@ -418,8 +429,8 @@ The Pi can run phases 1 and 2 as a test node from the start.
 
 ## Open questions
 
-- **Deletion versus freezing:** is a 72-hour moderation window long enough for small volunteer
-  moderator teams? Should it differ per board?
+- **Deletion versus freezing:** what default moderation window suits small volunteer moderator
+  teams? (Operators can change it, per board.)
 - **Quota size:** what quota stops spam without driving away members who have little
   bandwidth?
 - **Operator succession:** if the operator disappears, can the root key hand a site to a
@@ -428,5 +439,3 @@ The Pi can run phases 1 and 2 as a test node from the start.
   accountability that seeding is meant to buy?
 - **Video on tier 1:** never, or short low-resolution clips under a size cap?
 - **Server-side search:** on the server only, or a search index shipped with each sealed epoch?
-- **Tiers versus ratings:** should `rating:explicit` media be allowed on tier 2 at all, given
-  that clearnet swarms are public?
