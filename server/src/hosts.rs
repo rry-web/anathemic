@@ -273,6 +273,20 @@ impl Site {
     }
 
     /// The hosts on the list other than this one, with their keys
+    /// The I2P addresses of the site's hosts in service, other than the site's own address
+    pub(crate) fn host_addresses(&self) -> Result<Vec<String>, Fail> {
+        let Some(signed) = load_hosts(&self.db())? else { return Ok(Vec::new()) };
+        let site_addresses = self.about()?.2;
+        Ok(signed
+            .peek()?
+            .hosts
+            .into_iter()
+            .filter(|host| !host.retired && !site_addresses.contains(&host.address))
+            .map(|host| host.address)
+            .filter(|address| anathemic_core::i2p::b32_hash(address).is_some())
+            .collect())
+    }
+
     fn other_hosts(&self) -> Result<Vec<Host>, Fail> {
         let Some(signed) = load_hosts(&self.db())? else { return Ok(Vec::new()) };
         let hosts = signed.peek()?;

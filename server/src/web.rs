@@ -97,8 +97,12 @@ impl Source for Site {
     fn submit_web(&self, board: &str, content: Content, from: Option<&str>, now: u64) -> Result<Signed<Post>, Fail> {
         Site::submit_web(self, board, content, from, now)
     }
+    /// The site's other hosts first, then mirrors seeding through its tracker
     fn mirrors(&self) -> Vec<String> {
-        self.tracker.mirrors(now(), 3).iter().map(anathemic_core::i2p::b32_address).collect()
+        let mut addresses = self.host_addresses().unwrap_or_default();
+        addresses.extend(self.tracker.mirrors(now(), 3).iter().map(anathemic_core::i2p::b32_address));
+        addresses.truncate(anathemic_core::link::MAX_LINK_MIRRORS);
+        addresses
     }
     fn moderation(&self) -> Result<Arc<Moderation>, Fail> {
         Site::moderation(self)

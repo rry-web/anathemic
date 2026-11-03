@@ -55,10 +55,17 @@ scripts/start-site.sh --name "My Site" --board general:General --web-posting --q
 
 # A mirror, on this computer or another, from the share link the site script printed
 scripts/start-mirror.sh 'anathemic:….b32.i2p?root=…'
+
+# A trusted host, run by someone you'd trust with the server itself: it copies the site and
+# takes over if your server is down for 30 minutes (--quick: 2). It prints an add-host
+# command for you to run on the site's computer.
+scripts/start-host.sh --name alice 'anathemic:….b32.i2p?root=…'
 ```
 
-Run either again with no arguments to start it from where it left off: the site lives in
-`./site-data` and the mirror in `./mirror-data` (`--data` to change). On its first run the site
+Run any of them again with no arguments to start it from where it left off: the site lives in
+`./site-data`, the mirror in `./mirror-data` and the host in `./host-data` (`--data` to
+change). The site script gives its server a second I2P address of its own for hosts to reach
+it, and share links list the site's hosts, so readers with one find whichever host is writing. On its first run the site
 script also gives you a member key that's a moderator, and prints the commands to post and
 moderate with it. A new router takes a few minutes to join I2P; the site script says when its
 address starts answering. `--help` shows each script's options, such as `--port-base` for a

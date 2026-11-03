@@ -84,12 +84,19 @@ fi
 ROUTER="$DATA/i2pd"
 mkdir -p "$ROUTER"
 cat > "$ROUTER/tunnels.conf" <<EOF
-# Written by start-site.sh: publishes the site's server over I2P
+# Written by start-site.sh. The site's address, which readers use:
 [anathemic]
 type = http
 host = 127.0.0.1
 port = $LISTEN
 keys = site.dat
+
+# This server's own address, where trusted hosts reach it (see start-host.sh)
+[anathemic-host]
+type = http
+host = 127.0.0.1
+port = $LISTEN
+keys = host.dat
 EOF
 say "Starting a private I2P router in $ROUTER"
 start_router "$ROUTER" "$PORT_BASE" 0
@@ -98,6 +105,12 @@ ADDRESS="$(server i2p-address "$ROUTER/site.dat")" || die "couldn't read the sit
 if [ "$(cat "$DATA/address" 2>/dev/null)" != "$ADDRESS" ]; then
     server set-site --address "$ADDRESS" >/dev/null || die "couldn't set the site's address"
     echo "$ADDRESS" > "$DATA/address"
+fi
+wait_for 60 test -s "$ROUTER/host.dat" || die "i2pd didn't make this server's own keys; see $ROUTER/i2pd.log"
+HOST_ADDRESS="$(server i2p-address "$ROUTER/host.dat")" || die "couldn't read this server's own I2P address"
+if [ "$(cat "$DATA/host-address" 2>/dev/null)" != "$HOST_ADDRESS" ]; then
+    server set-site --host-address "$HOST_ADDRESS" >/dev/null || die "couldn't set this server's own address"
+    echo "$HOST_ADDRESS" > "$DATA/host-address"
 fi
 
 # The server
@@ -132,6 +145,10 @@ $(say "The site is running.")
 
   Mirror it, from this computer or another:
     scripts/start-mirror.sh '$LINK'
+
+  Let someone you trust keep it taking posts while this server is down:
+    scripts/start-host.sh '$LINK'
+  It prints the command to run here to add them. Hosts: $BIN/anathemic-server --data $SITE hosts
 
   Post and moderate as the operator (with the moderator key this script made):
     $CLIENT --direct post $LOCAL $BOARD --title "Hello" "First post"

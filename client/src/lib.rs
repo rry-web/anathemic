@@ -240,12 +240,19 @@ impl Client {
     /// root key, and the mirrors this client knows of
     pub fn share_link(&self, site: &Verified) -> Link {
         let address = site.manifest.addresses.first().cloned().unwrap_or_else(|| self.base.trim_start_matches("http://").to_string());
-        let mirrors = load_mirrors(&self.home, &site.manifest.root)
-            .iter()
-            .map(|m| m.trim_start_matches("http://").to_string())
-            .filter(|host| i2p::b32_hash(host).is_some())
-            .take(MAX_LINK_MIRRORS)
-            .collect();
+        // The site's hosts first: they serve the signed manifest as mirrors do, and take posts
+        let hosts = site.manifest.hosts.as_ref().and_then(|hosts| hosts.peek().ok()).map(|hosts| hosts.hosts).unwrap_or_default();
+        let mut mirrors: Vec<String> = Vec::new();
+        let candidates = hosts
+            .into_iter()
+            .filter(|host| !host.retired)
+            .map(|host| host.address)
+            .chain(load_mirrors(&self.home, &site.manifest.root).into_iter().map(|m| m.trim_start_matches("http://").to_string()));
+        for candidate in candidates {
+            if candidate != address && i2p::b32_hash(&candidate).is_some() && !mirrors.contains(&candidate) && mirrors.len() < MAX_LINK_MIRRORS {
+                mirrors.push(candidate);
+            }
+        }
         Link { address, root: site.manifest.root, mirrors }
     }
 
